@@ -399,8 +399,9 @@ model Prediction {
   htFtProbabilities      String @default("{}")
   featureWeights         String @default("{}")
 
-  modelConfidence Float    @default(0)
-  topInsights     String   @default("[]")
+  modelConfidence  Float    @default(0)
+  topInsights      String   @default("[]")
+  featureBreakdown String   @default("{}")
 
   fixture     Fixture     @relation(fields: [fixtureId], references: [id])
   competition Competition @relation(fields: [competitionId], references: [id])

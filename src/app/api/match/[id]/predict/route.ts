@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { predictMatch, savePrediction } from "@/lib/prediction";
+import { predictMatch } from "@/lib/prediction";
 
 export async function GET(
   _request: Request,
@@ -13,7 +13,6 @@ export async function GET(
 
   try {
     const prediction = await predictMatch(fixtureId);
-    await savePrediction(prediction);
     return NextResponse.json(prediction);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

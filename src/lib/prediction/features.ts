@@ -278,7 +278,7 @@ export function computeH2HFeatures(
 export function computeSquadFeatures(
   players: Array<{
     isKeyPlayer: boolean;
-    seasonAgg: Array<{ xgPer90: number; xaPer90: number; isPenaltyTaker: boolean }>;
+    seasonAgg: Array<{ xgPer90: number; xaPer90: number; isPenaltyTaker: boolean; minutes: number; matches: number }>;
     injuries: Array<{ status: string }>;
   }>,
   teamTotalXg: number,
@@ -293,8 +293,12 @@ export function computeSquadFeatures(
 
     const agg = p.seasonAgg[0];
     if (agg) {
-      missingXg += agg.xgPer90;
-      missingXa += agg.xaPer90;
+      // Scale per-90 rate by actual minutes-per-game to get per-game contribution.
+      // A sub averaging 45 min/game with 0.5 xgPer90 contributes ~0.25 xG/game, not 0.5.
+      const minsPerGame = agg.matches > 0 ? agg.minutes / agg.matches : 90;
+      const scaleFactor = minsPerGame / 90;
+      missingXg += agg.xgPer90 * scaleFactor;
+      missingXa += agg.xaPer90 * scaleFactor;
       if (agg.isPenaltyTaker) penaltyTakerFit = false;
     }
     if (p.isKeyPlayer) keyAbsent = true;
@@ -302,9 +306,6 @@ export function computeSquadFeatures(
 
   const totalXg90 = teamTotalXg > 0 ? teamTotalXg : 1;
 
-  // xgPer90 is a per-90-minute rate, not per-game. For players averaging fewer
-  // minutes this overstates their actual per-game contribution. We accept the
-  // approximation because individual minutes-per-game data isn't in the schema.
   return {
     missingPlayersXgShare: missingXg / totalXg90,
     missingPlayersXaShare: missingXa / totalXg90,
@@ -334,7 +335,7 @@ export function computeContextFeatures(
   return {
     isDerby: false,
     leaguePositionGap: gap,
-    homeAdvantage: 0.42,
+    homeAdvantage: 0,
     matchImportance: motivation,
     daysSinceLastMatch: daysSince,
     isAfterEuropean,
@@ -426,9 +427,10 @@ export function computeLambda(inputs: LambdaInputs): number {
 
   let lambda = LEAGUE_AVG_XG * attackStrength * defenseWeakness;
 
+  // Symmetric home advantage: zero-sum so total expected goals aren't inflated
   lambda += inputs.isHome
-    ? inputs.homeAdvantageGoals
-    : -inputs.homeAdvantageGoals * 0.5;
+    ? inputs.homeAdvantageGoals / 2
+    : -inputs.homeAdvantageGoals / 2;
 
   lambda *= inputs.injuryModifier;
   lambda *= inputs.formModifier;

@@ -4,51 +4,39 @@ import { predictMatch, type PredictionResult } from "@/lib/prediction";
 
 const EUROPEAN_COMPETITION_IDS = ["CL", "EC", "CLI"];
 
+import type {
+  Competition,
+  Fixture,
+  H2HMatch,
+  Injury,
+  Player,
+  PlayerSeasonAgg,
+  Team,
+  TeamSeasonStats,
+} from "@prisma/client";
+
+type FixtureWithRelations = Fixture & {
+  homeTeam: Team;
+  awayTeam: Team;
+  competition: Competition;
+};
+
+type PlayerWithRelations = Player & {
+  seasonAgg: PlayerSeasonAgg[];
+  injuries: Injury[];
+};
+
+type H2HWithComp = H2HMatch & { competition: Competition | null };
+
 export interface MatchData {
-  fixture: NonNullable<
-    Awaited<
-      ReturnType<
-        typeof prisma.fixture.findUnique<{
-          include: { homeTeam: true; awayTeam: true; competition: true };
-        }>
-      >
-    >
-  >;
-  homeStats: Awaited<ReturnType<typeof prisma.teamSeasonStats.findFirst>>;
-  awayStats: Awaited<ReturnType<typeof prisma.teamSeasonStats.findFirst>>;
-  homeForm: Awaited<
-    ReturnType<
-      typeof prisma.fixture.findMany<{
-        include: { homeTeam: true; awayTeam: true; competition: true };
-      }>
-    >
-  >;
-  awayForm: Awaited<
-    ReturnType<
-      typeof prisma.fixture.findMany<{
-        include: { homeTeam: true; awayTeam: true; competition: true };
-      }>
-    >
-  >;
-  h2h: Awaited<
-    ReturnType<
-      typeof prisma.h2HMatch.findMany<{ include: { competition: true } }>
-    >
-  >;
-  homePlayers: Awaited<
-    ReturnType<
-      typeof prisma.player.findMany<{
-        include: { seasonAgg: true; injuries: true };
-      }>
-    >
-  >;
-  awayPlayers: Awaited<
-    ReturnType<
-      typeof prisma.player.findMany<{
-        include: { seasonAgg: true; injuries: true };
-      }>
-    >
-  >;
+  fixture: FixtureWithRelations;
+  homeStats: TeamSeasonStats | null;
+  awayStats: TeamSeasonStats | null;
+  homeForm: FixtureWithRelations[];
+  awayForm: FixtureWithRelations[];
+  h2h: H2HWithComp[];
+  homePlayers: PlayerWithRelations[];
+  awayPlayers: PlayerWithRelations[];
   prediction: PredictionResult | null;
 }
 

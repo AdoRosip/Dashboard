@@ -16,7 +16,8 @@ export default async function MatchPage({
   const data = await fetchMatchData(fixtureId);
   if (!data) notFound();
 
-  const serialize = <T,>(obj: T): T => JSON.parse(JSON.stringify(obj));
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const serialize = (obj: unknown): any => JSON.parse(JSON.stringify(obj));
 
   return (
     <MatchDashboard

@@ -133,8 +133,6 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     awaySeasonStats,
     homeMatchStats,
     awayMatchStats,
-    homeSituational,
-    awaySituational,
   ] = await Promise.all([
     prisma.teamSeasonStats.findFirst({
       where: { teamId: fixture.homeTeamId, competitionId: homeStatsCompId, season: CURRENT_SEASON },
@@ -153,12 +151,6 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
       orderBy: { fixture: { utcDate: "desc" } },
       take: 15,
       include: { fixture: { select: { utcDate: true } } },
-    }),
-    prisma.teamSituationalStats.findFirst({
-      where: { teamId: fixture.homeTeamId, competitionId: homeStatsCompId, season: CURRENT_SEASON },
-    }),
-    prisma.teamSituationalStats.findFirst({
-      where: { teamId: fixture.awayTeamId, competitionId: awayStatsCompId, season: CURRENT_SEASON },
     }),
   ]);
 
@@ -367,6 +359,8 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     awayXgPerGame,
     homeXgaPerGame,
     awayXgaPerGame,
+    homeVenueXg: homeAttack.attackRatingVenue ?? homeXgPerGame,
+    awayVenueXga: awayDefense.defenseRatingVenue ?? awayXgaPerGame,
     homeForm: homeForm.formPointsLast5 ?? 0,
     awayForm: awayForm.formPointsLast5 ?? 0,
     homeOverperf: homeForm.xgOverperformance ?? 0,
@@ -383,8 +377,6 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     btts,
     homeSeasonStats,
     awaySeasonStats,
-    homeSituational,
-    awaySituational,
   });
 
   const result: PredictionResult = {
@@ -468,6 +460,7 @@ function reconstructPredictionResult(
     featureWeights: string;
     modelConfidence: number;
     topInsights: string;
+    featureBreakdown: string;
   },
   fixtureId: number,
 ): PredictionResult {
@@ -480,6 +473,20 @@ function reconstructPredictionResult(
     })
     .sort((a, b) => b.prob - a.prob)
     .slice(0, 10);
+
+  const defaultBreakdown: FeatureBreakdown = {
+    homeAttack: 0, homeDefense: 0, awayAttack: 0, awayDefense: 0,
+    homeForm: 0, awayForm: 0,
+    h2h: { totalMeetings: 0, homeWinRate: 0.45, awayWinRate: 0.28, drawRate: 0.27, avgTotalGoals: 2.5, bttsRate: 0.5, over25Rate: 0.5, recentTrend: "neutral" },
+    homeInjuryImpact: 0, awayInjuryImpact: 0,
+    homeAdvantage: 0.25, tacticalStyle: "mixed",
+  };
+
+  let breakdown = defaultBreakdown;
+  try {
+    const parsed = JSON.parse(cached.featureBreakdown || "{}");
+    if (parsed.homeAttack !== undefined) breakdown = parsed;
+  } catch { /* use default */ }
 
   return {
     fixtureId,
@@ -504,19 +511,7 @@ function reconstructPredictionResult(
     topScorelines: topSorted,
     modelConfidence: cached.modelConfidence,
     featureWeights: JSON.parse(cached.featureWeights || "{}"),
-    featureBreakdown: {
-      homeAttack: 0,
-      homeDefense: 0,
-      awayAttack: 0,
-      awayDefense: 0,
-      homeForm: 0,
-      awayForm: 0,
-      h2h: { totalMeetings: 0, homeWinRate: 0.45, awayWinRate: 0.28, drawRate: 0.27, avgTotalGoals: 2.5, bttsRate: 0.5, over25Rate: 0.5, recentTrend: "neutral" },
-      homeInjuryImpact: 0,
-      awayInjuryImpact: 0,
-      homeAdvantage: 0.25,
-      tacticalStyle: "mixed",
-    },
+    featureBreakdown: breakdown,
     insights: JSON.parse(cached.topInsights || "[]"),
   };
 }
@@ -557,6 +552,7 @@ export async function savePrediction(pred: PredictionResult) {
       featureWeights: JSON.stringify(pred.featureWeights),
       modelConfidence: pred.modelConfidence,
       topInsights: JSON.stringify(pred.insights),
+      featureBreakdown: JSON.stringify(pred.featureBreakdown),
     },
     create: {
       fixtureId: pred.fixtureId,
@@ -582,6 +578,7 @@ export async function savePrediction(pred: PredictionResult) {
       featureWeights: JSON.stringify(pred.featureWeights),
       modelConfidence: pred.modelConfidence,
       topInsights: JSON.stringify(pred.insights),
+      featureBreakdown: JSON.stringify(pred.featureBreakdown),
     },
   });
 }
@@ -597,6 +594,8 @@ interface InsightInput {
   awayXgPerGame: number;
   homeXgaPerGame: number;
   awayXgaPerGame: number;
+  homeVenueXg: number;
+  awayVenueXga: number;
   homeForm: number;
   awayForm: number;
   homeOverperf: number;
@@ -613,22 +612,24 @@ interface InsightInput {
   btts: { yes: number; no: number };
   homeSeasonStats: { matchesPlayedHome?: number; goalsHome?: number; concededHome?: number; cleanSheets?: number; matchesPlayed?: number; bttsCount?: number } | null;
   awaySeasonStats: { matchesPlayedAway?: number; goalsAway?: number; concededAway?: number; cleanSheets?: number; matchesPlayed?: number } | null;
-  homeSituational: { goals76to90?: number; conceded0to15?: number; winPctScoringFirst?: number } | null;
-  awaySituational: { goals76to90?: number; conceded0to15?: number; winPctScoringFirst?: number } | null;
 }
 
 function generatePredictionInsights(ctx: InsightInput): string[] {
   const insights: string[] = [];
 
-  // Attacking strength
-  if (ctx.homeXgPerGame > 2.0)
-    insights.push(`${ctx.homeTeamName} creates high-quality chances at home (${ctx.homeXgPerGame.toFixed(2)} xG/game) — primary driver for home win probability`);
+  // Attacking strength — use venue-specific xG when available
+  if (ctx.homeVenueXg > 2.0)
+    insights.push(`${ctx.homeTeamName} creates high-quality chances at home (${ctx.homeVenueXg.toFixed(2)} xG/game at home)`);
+  else if (ctx.homeXgPerGame > 2.0)
+    insights.push(`${ctx.homeTeamName} is a prolific attack (${ctx.homeXgPerGame.toFixed(2)} xG/game overall)`);
 
-  if (ctx.awayXgaPerGame > 1.7)
-    insights.push(`${ctx.awayTeamName} has been leaky on the road, conceding ${ctx.awayXgaPerGame.toFixed(2)} xG/game away`);
+  if (ctx.awayVenueXga > 1.7)
+    insights.push(`${ctx.awayTeamName} has been leaky away from home, conceding ${ctx.awayVenueXga.toFixed(2)} xG/game away`);
+  else if (ctx.awayXgaPerGame > 1.7)
+    insights.push(`${ctx.awayTeamName} has a porous defense (${ctx.awayXgaPerGame.toFixed(2)} xGA/game overall)`);
 
   if (ctx.awayXgPerGame > 1.8)
-    insights.push(`${ctx.awayTeamName} carries attacking threat (${ctx.awayXgPerGame.toFixed(2)} xG/game) even away from home`);
+    insights.push(`${ctx.awayTeamName} carries attacking threat (${ctx.awayXgPerGame.toFixed(2)} xG/game overall)`);
 
   // Form
   if (ctx.homeForm >= 12)
@@ -686,12 +687,6 @@ function generatePredictionInsights(ctx: InsightInput): string[] {
     insights.push("Derby match — historically tighter margins with fewer goals and more cards");
   if (ctx.contextFeatures.motivationFactor === "high_negative")
     insights.push("Relegation stakes in play — expect maximum intensity from both sides");
-
-  // Scoring patterns
-  if (ctx.homeSituational?.goals76to90 && ctx.homeSituational.goals76to90 > 3)
-    insights.push(`${ctx.homeTeamName} is dangerous late — disproportionate goals in 76-90 min`);
-  if (ctx.awaySituational?.conceded0to15 && ctx.awaySituational.conceded0to15 > 3)
-    insights.push(`${ctx.awayTeamName} is vulnerable early — concedes frequently in the first 15 minutes`);
 
   // Clean sheet sustainability
   if (ctx.homeSeasonStats) {
