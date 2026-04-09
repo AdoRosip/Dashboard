@@ -18,8 +18,6 @@ import {
   classifyTacticalMatchup,
   applyRegressionToMean,
   computeLambda,
-  weightedAvg,
-  getFeatureWeights,
   type H2HFeatures,
 } from "./features";
 import {
@@ -83,9 +81,29 @@ interface FeatureBreakdown {
 
 const MODEL_VERSION = "v1.0-dc-poisson";
 const LEAGUE_AVG_XG = 1.35;
-const HOME_ADVANTAGE_GOALS = 0.25;
+const PREDICTION_CACHE_HOURS = 6;
+
+const EUROPEAN_COMPETITIONS = new Set(["CL", "EC", "CLI"]);
+
+const HOME_ADVANTAGE_GOALS_BY_LEAGUE: Record<string, number> = {
+  PL: 0.22, PD: 0.32, BL1: 0.28, SA: 0.27, FL1: 0.25,
+  CL: 0.20, EC: 0.20, CLI: 0.20,
+};
 
 export async function predictMatch(fixtureId: number): Promise<PredictionResult> {
+  // ── Check cache (Bug 5) ───────────────────────────────────
+  const cached = await prisma.prediction.findFirst({
+    where: { fixtureId, modelVersion: MODEL_VERSION },
+    orderBy: { createdAt: "desc" },
+  });
+
+  if (cached) {
+    const ageMs = Date.now() - cached.createdAt.getTime();
+    if (ageMs < PREDICTION_CACHE_HOURS * 60 * 60 * 1000) {
+      return reconstructPredictionResult(cached, fixtureId);
+    }
+  }
+
   const fixture = await prisma.fixture.findUnique({
     where: { id: fixtureId },
     include: {
@@ -97,7 +115,18 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
 
   if (!fixture) throw new Error(`Fixture ${fixtureId} not found`);
 
+  const isEuropean = EUROPEAN_COMPETITIONS.has(fixture.competitionId);
+  const homeAdvGoals = HOME_ADVANTAGE_GOALS_BY_LEAGUE[fixture.competitionId] ?? 0.25;
+
   // ── Fetch all data ──────────────────────────────────────────
+
+  // For European fixtures, use the team's domestic league for season stats
+  const homeStatsCompId = isEuropean
+    ? (fixture.homeTeam.competitionId ?? fixture.competitionId)
+    : fixture.competitionId;
+  const awayStatsCompId = isEuropean
+    ? (fixture.awayTeam.competitionId ?? fixture.competitionId)
+    : fixture.competitionId;
 
   const [
     homeSeasonStats,
@@ -108,26 +137,28 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     awaySituational,
   ] = await Promise.all([
     prisma.teamSeasonStats.findFirst({
-      where: { teamId: fixture.homeTeamId, competitionId: fixture.competitionId, season: CURRENT_SEASON },
+      where: { teamId: fixture.homeTeamId, competitionId: homeStatsCompId, season: CURRENT_SEASON },
     }),
     prisma.teamSeasonStats.findFirst({
-      where: { teamId: fixture.awayTeamId, competitionId: fixture.competitionId, season: CURRENT_SEASON },
+      where: { teamId: fixture.awayTeamId, competitionId: awayStatsCompId, season: CURRENT_SEASON },
     }),
     prisma.teamMatchStats.findMany({
       where: { teamId: fixture.homeTeamId },
       orderBy: { fixture: { utcDate: "desc" } },
       take: 15,
+      include: { fixture: { select: { utcDate: true } } },
     }),
     prisma.teamMatchStats.findMany({
       where: { teamId: fixture.awayTeamId },
       orderBy: { fixture: { utcDate: "desc" } },
       take: 15,
+      include: { fixture: { select: { utcDate: true } } },
     }),
     prisma.teamSituationalStats.findFirst({
-      where: { teamId: fixture.homeTeamId, competitionId: fixture.competitionId, season: CURRENT_SEASON },
+      where: { teamId: fixture.homeTeamId, competitionId: homeStatsCompId, season: CURRENT_SEASON },
     }),
     prisma.teamSituationalStats.findFirst({
-      where: { teamId: fixture.awayTeamId, competitionId: fixture.competitionId, season: CURRENT_SEASON },
+      where: { teamId: fixture.awayTeamId, competitionId: awayStatsCompId, season: CURRENT_SEASON },
     }),
   ]);
 
@@ -178,7 +209,9 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
   const awaySquad = computeSquadFeatures(awayPlayers, awayXgTotal);
 
   const lastHomeMatch = homeMatchStats[0];
-  const lastHomeDate = lastHomeMatch ? new Date() : null;
+  const lastHomeDate = lastHomeMatch ? new Date(lastHomeMatch.fixture.utcDate) : null;
+  const lastAwayMatch = awayMatchStats[0];
+  const lastAwayDate = lastAwayMatch ? new Date(lastAwayMatch.fixture.utcDate) : null;
 
   const contextFeatures = computeContextFeatures(
     homeSeasonStats, awaySeasonStats, lastHomeDate, false,
@@ -233,57 +266,67 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     awayXgaPerGame = LEAGUE_AVG_XG;
   }
 
-  // Regression to mean
-  const homeRegression = applyRegressionToMean(
+  // Regression to mean — clamped to [0.75, 1.25] to prevent extreme swings
+  const homeRegressionRaw = applyRegressionToMean(
     homeXgPerGame, homeForm.xgOverperformance ?? 0, matchday, LEAGUE_AVG_XG,
   ) / Math.max(homeXgPerGame, 0.01);
+  const homeRegression = Math.max(0.75, Math.min(1.25, homeRegressionRaw));
 
-  const awayRegression = applyRegressionToMean(
+  const awayRegressionRaw = applyRegressionToMean(
     awayXgPerGame, awayForm.xgOverperformance ?? 0, matchday, LEAGUE_AVG_XG,
   ) / Math.max(awayXgPerGame, 0.01);
+  const awayRegression = Math.max(0.75, Math.min(1.25, awayRegressionRaw));
 
-  // Fatigue adjustments
-  const homeFatigue = (contextFeatures.daysSinceLastMatch ?? 7) < 3 ? 0.05 : 0;
-  const awayFatigue = 0;
+  // Injury modifiers (multiplicative, e.g. 0.85 = missing 15% of xG)
+  const homeInjuryMod = 1 - (homeSquad.missingPlayersXgShare ?? 0);
+  const awayInjuryMod = 1 - (awaySquad.missingPlayersXgShare ?? 0);
 
-  // H2H shrinkage
-  const h2hWeight = Math.min(1.0, h2hFeatures.totalMeetings / 10);
-  const h2hHomeAdj = h2hWeight * (h2hFeatures.homeWinRate - 0.45) + 0;
-  const h2hAwayAdj = h2hWeight * (h2hFeatures.awayWinRate - 0.28) + 0;
-
-  // Motivation boost
-  const motivBoost = contextFeatures.motivationFactor === "high_positive" ? 0.05
-    : contextFeatures.motivationFactor === "high_negative" ? 0.03
+  // Form modifiers (trend slope → multiplier, capped ±15%)
+  const motivBoost = contextFeatures.motivationFactor === "high_positive" ? 0.03
+    : contextFeatures.motivationFactor === "high_negative" ? 0.02
     : 0;
+  const homeFormMod = Math.max(0.85, Math.min(1.15, 1 + (homeForm.formXgTrend ?? 0) * 0.5 + motivBoost));
+  const awayFormMod = Math.max(0.85, Math.min(1.15, 1 + (awayForm.formXgTrend ?? 0) * 0.5 + motivBoost));
+
+  // H2H modifiers (shrunk toward 1.0 by sample size, capped ±10%)
+  const h2hWeight = Math.min(1.0, h2hFeatures.totalMeetings / 10);
+  const homeH2hAdj = h2hWeight * (h2hFeatures.homeWinRate - 0.45);
+  const awayH2hAdj = h2hWeight * (h2hFeatures.awayWinRate - 0.28);
+  const homeH2hMod = Math.max(0.90, Math.min(1.10, 1 + homeH2hAdj * 0.3));
+  const awayH2hMod = Math.max(0.90, Math.min(1.10, 1 + awayH2hAdj * 0.3));
+
+  // Fatigue modifiers — both teams checked
+  const homeDaysSinceLast = contextFeatures.daysSinceLastMatch ?? 7;
+  const awayDaysSinceLast = lastAwayDate
+    ? (Date.now() - lastAwayDate.getTime()) / (1000 * 60 * 60 * 24)
+    : 7;
+  const homeFatigueMod = homeDaysSinceLast < 3 ? 0.95 : 1.0;
+  const awayFatigueMod = awayDaysSinceLast < 3 ? 0.95 : 1.0;
 
   // Compute final lambdas
   const lambdaHome = computeLambda({
     attackRating: homeXgPerGame,
     opponentDefenseRating: awayXgaPerGame,
-    venueAttackRating: homeAttack.attackRatingVenue ?? homeXgPerGame,
-    opponentVenueDefenseRating: awayDefense.defenseRatingVenue ?? awayXgaPerGame,
-    homeAdvantage: HOME_ADVANTAGE_GOALS,
-    injuryDiscount: homeSquad.missingPlayersXgShare ?? 0,
-    formBoost: (homeForm.formXgTrend ?? 0) * 2,
-    h2hAdjustment: h2hHomeAdj,
-    fatigueAdjustment: homeFatigue,
-    motivationBoost: motivBoost,
-    regressionFactor: homeRegression,
-  }, true);
+    isHome: true,
+    homeAdvantageGoals: homeAdvGoals,
+    injuryModifier: homeInjuryMod,
+    formModifier: homeFormMod,
+    h2hModifier: homeH2hMod,
+    fatigueModifier: homeFatigueMod,
+    regressionModifier: homeRegression,
+  });
 
   const lambdaAway = computeLambda({
     attackRating: awayXgPerGame,
     opponentDefenseRating: homeXgaPerGame,
-    venueAttackRating: awayAttack.attackRatingVenue ?? awayXgPerGame,
-    opponentVenueDefenseRating: homeDefense.defenseRatingVenue ?? homeXgaPerGame,
-    homeAdvantage: HOME_ADVANTAGE_GOALS,
-    injuryDiscount: awaySquad.missingPlayersXgShare ?? 0,
-    formBoost: (awayForm.formXgTrend ?? 0) * 2,
-    h2hAdjustment: h2hAwayAdj,
-    fatigueAdjustment: awayFatigue,
-    motivationBoost: motivBoost,
-    regressionFactor: awayRegression,
-  }, false);
+    isHome: false,
+    homeAdvantageGoals: homeAdvGoals,
+    injuryModifier: awayInjuryMod,
+    formModifier: awayFormMod,
+    h2hModifier: awayH2hMod,
+    fatigueModifier: awayFatigueMod,
+    regressionModifier: awayRegression,
+  });
 
   // ── Build predictions ──────────────────────────────────────
 
@@ -344,7 +387,7 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     awaySituational,
   });
 
-  return {
+  const result: PredictionResult = {
     fixtureId,
     modelVersion: MODEL_VERSION,
     probHomeWin: round4(result1x2.home),
@@ -366,7 +409,13 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     htFtProbabilities: htft,
     topScorelines: topLines.map((l) => ({ ...l, prob: round4(l.prob) })),
     modelConfidence: round4(confidence),
-    featureWeights: getFeatureWeights() as unknown as Record<string, number>,
+    featureWeights: {
+      injuryModifier: round4(homeInjuryMod),
+      formModifier: round4(homeFormMod),
+      h2hModifier: round4(homeH2hMod),
+      fatigueModifier: round4(homeFatigueMod),
+      regressionModifier: round4(homeRegression),
+    },
     featureBreakdown: {
       homeAttack: round4(homeXgPerGame),
       homeDefense: round4(homeXgaPerGame),
@@ -377,15 +426,99 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
       h2h: h2hFeatures,
       homeInjuryImpact: round4(homeSquad.missingPlayersXgShare ?? 0),
       awayInjuryImpact: round4(awaySquad.missingPlayersXgShare ?? 0),
-      homeAdvantage: HOME_ADVANTAGE_GOALS,
+      homeAdvantage: homeAdvGoals,
       tacticalStyle: tactical.styleClash,
     },
     insights,
   };
+
+  // Auto-save so subsequent page views hit the cache
+  await savePrediction(result).catch(() => {});
+
+  return result;
 }
 
 function round4(n: number): number {
   return Math.round(n * 10000) / 10000;
+}
+
+// ─── CACHE RECONSTRUCTION ────────────────────────────────────
+
+function reconstructPredictionResult(
+  cached: {
+    fixtureId: number;
+    modelVersion: string;
+    probHomeWin: number;
+    probDraw: number;
+    probAwayWin: number;
+    lambdaHome: number;
+    lambdaAway: number;
+    expectedTotalGoals: number;
+    probOver05: number;
+    probOver15: number;
+    probOver25: number;
+    probOver35: number;
+    probOver45: number;
+    probBttsYes: number;
+    probBttsNo: number;
+    probHomeCs: number;
+    probAwayCs: number;
+    scorelineProbabilities: string;
+    htFtProbabilities: string;
+    featureWeights: string;
+    modelConfidence: number;
+    topInsights: string;
+  },
+  fixtureId: number,
+): PredictionResult {
+  const scorelines: Record<string, number> = JSON.parse(cached.scorelineProbabilities || "{}");
+
+  const topSorted = Object.entries(scorelines)
+    .map(([key, prob]) => {
+      const [h, a] = key.split("-").map(Number);
+      return { home: h, away: a, prob };
+    })
+    .sort((a, b) => b.prob - a.prob)
+    .slice(0, 10);
+
+  return {
+    fixtureId,
+    modelVersion: cached.modelVersion,
+    probHomeWin: cached.probHomeWin,
+    probDraw: cached.probDraw,
+    probAwayWin: cached.probAwayWin,
+    lambdaHome: cached.lambdaHome,
+    lambdaAway: cached.lambdaAway,
+    expectedTotalGoals: cached.expectedTotalGoals,
+    probOver05: cached.probOver05,
+    probOver15: cached.probOver15,
+    probOver25: cached.probOver25,
+    probOver35: cached.probOver35,
+    probOver45: cached.probOver45,
+    probBttsYes: cached.probBttsYes,
+    probBttsNo: cached.probBttsNo,
+    probHomeCs: cached.probHomeCs,
+    probAwayCs: cached.probAwayCs,
+    scorelineProbabilities: scorelines,
+    htFtProbabilities: JSON.parse(cached.htFtProbabilities || "{}"),
+    topScorelines: topSorted,
+    modelConfidence: cached.modelConfidence,
+    featureWeights: JSON.parse(cached.featureWeights || "{}"),
+    featureBreakdown: {
+      homeAttack: 0,
+      homeDefense: 0,
+      awayAttack: 0,
+      awayDefense: 0,
+      homeForm: 0,
+      awayForm: 0,
+      h2h: { totalMeetings: 0, homeWinRate: 0.45, awayWinRate: 0.28, drawRate: 0.27, avgTotalGoals: 2.5, bttsRate: 0.5, over25Rate: 0.5, recentTrend: "neutral" },
+      homeInjuryImpact: 0,
+      awayInjuryImpact: 0,
+      homeAdvantage: 0.25,
+      tacticalStyle: "mixed",
+    },
+    insights: JSON.parse(cached.topInsights || "[]"),
+  };
 }
 
 // ─── SAVE PREDICTION ─────────────────────────────────────────
@@ -568,9 +701,11 @@ function generatePredictionInsights(ctx: InsightInput): string[] {
       insights.push(`⚠ ${ctx.homeTeamName}'s clean sheet rate (${(csRate * 100).toFixed(0)}%) looks unsustainably high relative to xG conceded`);
   }
 
-  // BTTS from season stats
+  // BTTS from season stats (bttsCount may span home+away, so cap at matchesPlayed)
   if (ctx.homeSeasonStats && ctx.homeSeasonStats.matchesPlayed) {
-    const bttsPct = (ctx.homeSeasonStats.bttsCount ?? 0) / ctx.homeSeasonStats.matchesPlayed;
+    const mp = ctx.homeSeasonStats.matchesPlayed;
+    const bttsRaw = ctx.homeSeasonStats.bttsCount ?? 0;
+    const bttsPct = Math.min(1, bttsRaw / mp);
     if (bttsPct > 0.6)
       insights.push(`Both teams score in ${(bttsPct * 100).toFixed(0)}% of ${ctx.homeTeamName}'s matches this season`);
   }

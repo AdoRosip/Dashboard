@@ -9,4 +9,4 @@ export {
   scorelineMap,
   htFtProbs,
 } from "./poisson";
-export { getFeatureWeights, weightedAvg } from "./features";
+export { weightedAvg } from "./features";

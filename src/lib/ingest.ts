@@ -99,7 +99,29 @@ async function ensureCompetitions() {
   }
 }
 
+const EUROPEAN_COMP_IDS = new Set(["CL", "EC", "CLI"]);
+
 async function upsertTeam(team: FDTeam, competitionId: string) {
+  const isEuropean = EUROPEAN_COMP_IDS.has(competitionId);
+
+  // Never overwrite a domestic competitionId with a European one.
+  // A team's competitionId should reflect their primary domestic league.
+  if (isEuropean) {
+    const existing = await prisma.team.findUnique({ where: { id: team.id }, select: { competitionId: true } });
+    if (existing?.competitionId && !EUROPEAN_COMP_IDS.has(existing.competitionId)) {
+      await prisma.team.update({
+        where: { id: team.id },
+        data: {
+          name: team.name,
+          shortName: team.shortName ?? null,
+          tla: team.tla ?? null,
+          crest: team.crest ?? null,
+        },
+      });
+      return;
+    }
+  }
+
   await prisma.team.upsert({
     where: { id: team.id },
     update: {
@@ -419,7 +441,7 @@ export async function computeDerivedStats() {
     }
   }
 
-  // Mark key players (top 3 goal contributors per team)
+  // Mark key players (top 3 goal contributors per team) — atomic batch
   const playerStats = await prisma.playerSeasonAgg.findMany({
     where: { season: CURRENT_SEASON },
     include: { player: true },
@@ -436,15 +458,14 @@ export async function computeDerivedStats() {
     }
   }
 
-  await prisma.player.updateMany({ data: { isKeyPlayer: false } });
-  for (const [, playerIds] of teamTopPlayers) {
-    for (const pid of playerIds) {
-      await prisma.player.update({
-        where: { id: pid },
-        data: { isKeyPlayer: true },
-      });
-    }
-  }
+  const allKeyPlayerIds = Array.from(teamTopPlayers.values()).flat();
+  await prisma.$transaction([
+    prisma.player.updateMany({ data: { isKeyPlayer: false } }),
+    prisma.player.updateMany({
+      where: { id: { in: allKeyPlayerIds } },
+      data: { isKeyPlayer: true },
+    }),
+  ]);
 
   console.log("Derived stats computed.");
   await logRefresh("derived", "success");

@@ -181,9 +181,6 @@ export function computeDefensiveFeatures(
   const venueXga = venueMatches.map((m) => m.xgAgainst);
   const ppdaValues = recent.filter((m) => m.ppda != null).map((m) => m.ppda!);
   const csCount = recent.filter((m) => m.goalsConceded === 0).length;
-  const totalXga = recent.reduce((s, m) => s + m.xgAgainst, 0);
-  const spXga = recent.reduce((s, m) => s + (m.xgFromSetPieces > 0 ? m.xgAgainst * 0.3 : 0), 0);
-
   return {
     defenseRatingOverall: weightedAvg(xgaValues),
     defenseRatingVenue: venueXga.length > 0 ? weightedAvg(venueXga) : weightedAvg(xgaValues),
@@ -192,7 +189,8 @@ export function computeDefensiveFeatures(
       : weightedAvg(xgaValues),
     ppda: ppdaValues.length > 0 ? ppdaValues.reduce((a, b) => a + b, 0) / ppdaValues.length : 10,
     cleanSheetRate: recent.length > 0 ? csCount / recent.length : 0,
-    setPieceVulnerability: totalXga > 0 ? spXga / totalXga : 0,
+    // Schema lacks defensive set-piece xGA; xgFromSetPieces is attacking-side only.
+    setPieceVulnerability: 0,
   };
 }
 
@@ -304,6 +302,9 @@ export function computeSquadFeatures(
 
   const totalXg90 = teamTotalXg > 0 ? teamTotalXg : 1;
 
+  // xgPer90 is a per-90-minute rate, not per-game. For players averaging fewer
+  // minutes this overstates their actual per-game contribution. We accept the
+  // approximation because individual minutes-per-game data isn't in the schema.
   return {
     missingPlayersXgShare: missingXg / totalXg90,
     missingPlayersXaShare: missingXa / totalXg90,
@@ -390,55 +391,50 @@ export function applyRegressionToMean(
 
 // ─── LAMBDA COMPUTATION ──────────────────────────────────────────
 
+/**
+ * All modifiers should already be multiplicative factors close to 1.0
+ * when passed in. The caller (engine.ts) is responsible for computing
+ * each modifier from raw features before calling computeLambda.
+ */
 export interface LambdaInputs {
+  /** Team's xG-per-game attacking rate */
   attackRating: number;
+  /** Opponent's xGA-per-game rate */
   opponentDefenseRating: number;
-  venueAttackRating: number;
-  opponentVenueDefenseRating: number;
-  homeAdvantage: number;
-  injuryDiscount: number;
-  formBoost: number;
-  h2hAdjustment: number;
-  fatigueAdjustment: number;
-  motivationBoost: number;
-  regressionFactor: number;
+  /** Whether this team is the home side */
+  isHome: boolean;
+  /** Additive home-advantage in goals (typically 0.2–0.3) */
+  homeAdvantageGoals: number;
+  /** ~0.85 if missing 15% of xG production, 1.0 if fully fit */
+  injuryModifier: number;
+  /** ~1.05 if trending up, ~0.95 if trending down */
+  formModifier: number;
+  /** ~1.02 based on head-to-head record */
+  h2hModifier: number;
+  /** ~0.95 if short rest / European midweek, 1.0 otherwise */
+  fatigueModifier: number;
+  /** ~0.95 if overperforming xG, ~1.05 if underperforming (clamped [0.75,1.25]) */
+  regressionModifier: number;
 }
 
-const FEATURE_WEIGHTS = {
-  xgBased: 0.30,
-  defensive: 0.15,
-  formMomentum: 0.12,
-  h2h: 0.08,
-  injuries: 0.15,
-  contextual: 0.10,
-  tactical: 0.05,
-  homeAdvantage: 0.05,
-};
+const LEAGUE_AVG_XG = 1.35;
 
-export function computeLambda(inputs: LambdaInputs, isHome: boolean): number {
-  const baseXg =
-    inputs.attackRating * FEATURE_WEIGHTS.xgBased +
-    inputs.venueAttackRating * FEATURE_WEIGHTS.xgBased;
+export function computeLambda(inputs: LambdaInputs): number {
+  // Dixon-Coles style: strength ratios relative to league average
+  const attackStrength = inputs.attackRating / LEAGUE_AVG_XG;
+  const defenseWeakness = inputs.opponentDefenseRating / LEAGUE_AVG_XG;
 
-  const defenseModifier =
-    1 + (inputs.opponentDefenseRating - 1.3) * FEATURE_WEIGHTS.defensive;
+  let lambda = LEAGUE_AVG_XG * attackStrength * defenseWeakness;
 
-  const homeAdv = isHome
-    ? 1 + inputs.homeAdvantage * FEATURE_WEIGHTS.homeAdvantage * 2
-    : 1 - inputs.homeAdvantage * FEATURE_WEIGHTS.homeAdvantage;
+  lambda += inputs.isHome
+    ? inputs.homeAdvantageGoals
+    : -inputs.homeAdvantageGoals * 0.5;
 
-  const injuryMod = 1 - inputs.injuryDiscount * FEATURE_WEIGHTS.injuries;
-  const formMod = 1 + inputs.formBoost * FEATURE_WEIGHTS.formMomentum;
-  const h2hMod = 1 + inputs.h2hAdjustment * FEATURE_WEIGHTS.h2h;
-  const fatigueMod = 1 - inputs.fatigueAdjustment * FEATURE_WEIGHTS.contextual;
-  const motivMod = 1 + inputs.motivationBoost * FEATURE_WEIGHTS.contextual;
-
-  let lambda = baseXg * defenseModifier * homeAdv * injuryMod * formMod * h2hMod * fatigueMod * motivMod;
-  lambda *= inputs.regressionFactor;
+  lambda *= inputs.injuryModifier;
+  lambda *= inputs.formModifier;
+  lambda *= inputs.h2hModifier;
+  lambda *= inputs.fatigueModifier;
+  lambda *= inputs.regressionModifier;
 
   return Math.max(0.3, Math.min(5.0, lambda));
-}
-
-export function getFeatureWeights(): typeof FEATURE_WEIGHTS {
-  return { ...FEATURE_WEIGHTS };
 }
