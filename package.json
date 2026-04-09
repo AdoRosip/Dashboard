@@ -1,0 +1,41 @@
+{
+  "name": "football-analytics-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --webpack",
+    "build": "next build --webpack",
+    "start": "next start",
+    "lint": "next lint",
+    "db:generate": "npx prisma generate",
+    "db:push": "npx prisma db push",
+    "db:seed": "npx tsx src/lib/seed.ts",
+    "ingest": "npx tsx src/lib/ingest.ts",
+    "ingest:understat": "npx tsx src/lib/scrapers/understat-ingest.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "@tailwindcss/postcss": "^4.2.2",
+    "@types/node": "^25.5.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "lucide-react": "^1.8.0",
+    "next": "^16.2.3",
+    "node-cron": "^4.2.1",
+    "postcss": "^8.5.9",
+    "prisma": "^5.22.0",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "recharts": "^3.8.1",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^6.0.2"
+  },
+  "devDependencies": {
+    "@types/node-cron": "^3.0.11",
+    "eslint": "^9.39.4",
+    "eslint-config-next": "^16.2.3",
+    "tsx": "^4.21.0"
+  }
+}

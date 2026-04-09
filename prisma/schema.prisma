@@ -1,0 +1,420 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─── CORE ENTITIES ───────────────────────────────────────────────
+
+model Competition {
+  id        String  @id
+  name      String
+  code      String  @unique
+  country   String?
+  tier      Int     @default(1)
+  emblem    String?
+  isEuropean Boolean @default(false)
+  season    String  @default("2025")
+
+  teams               Team[]
+  fixtures            Fixture[]
+  h2hMatches          H2HMatch[]
+  teamSeasonStats     TeamSeasonStats[]
+  teamMatchStats      TeamMatchStats[]
+  playerMatchStats    PlayerMatchStats[]
+  playerSeasonAgg     PlayerSeasonAgg[]
+  teamSituationalStats TeamSituationalStats[]
+  predictions         Prediction[]
+  coaches             Coach[]
+}
+
+model Team {
+  id            Int     @id
+  name          String
+  shortName     String?
+  tla           String?
+  crest         String?
+  competitionId String?
+  venueName     String?
+  venueCapacity Int?
+
+  competition  Competition? @relation(fields: [competitionId], references: [id])
+
+  players          Player[]
+  homeFixtures     Fixture[]        @relation("HomeTeam")
+  awayFixtures     Fixture[]        @relation("AwayTeam")
+  seasonStats      TeamSeasonStats[]
+  matchStats       TeamMatchStats[]
+  h2hA             H2HMatch[]       @relation("H2HTeamA")
+  h2hB             H2HMatch[]       @relation("H2HTeamB")
+  situationalStats TeamSituationalStats[]
+  coaches          Coach[]
+  injuries         Injury[]
+}
+
+model Player {
+  id            Int      @id
+  teamId        Int
+  name          String
+  position      String?
+  dateOfBirth   String?
+  nationality   String?
+  shirtNumber   Int?
+  photo         String?
+  marketValue   Int?
+  isCaptain     Boolean  @default(false)
+  isKeyPlayer   Boolean  @default(false)
+  contractUntil String?
+
+  team         Team              @relation(fields: [teamId], references: [id])
+  matchStats   PlayerMatchStats[]
+  seasonAgg    PlayerSeasonAgg[]
+  injuries     Injury[]
+}
+
+// ─── MATCH DATA ──────────────────────────────────────────────────
+
+model Fixture {
+  id            Int       @id
+  competitionId String
+  matchday      Int?
+  homeTeamId    Int
+  awayTeamId    Int
+  utcDate       DateTime
+  venue         String?
+  status        String
+  scoreHomeFt   Int?
+  scoreAwayFt   Int?
+  scoreHomeHt   Int?
+  scoreAwayHt   Int?
+  winner        String?
+  refereeName   String?
+  attendance    Int?
+
+  competition    Competition      @relation(fields: [competitionId], references: [id])
+  homeTeam       Team             @relation("HomeTeam", fields: [homeTeamId], references: [id])
+  awayTeam       Team             @relation("AwayTeam", fields: [awayTeamId], references: [id])
+  teamMatchStats TeamMatchStats[]
+  playerMatchStats PlayerMatchStats[]
+  predictions    Prediction[]
+}
+
+// ─── GRANULAR TEAM STATS (per team per match) ────────────────────
+
+model TeamMatchStats {
+  id           Int  @id @default(autoincrement())
+  fixtureId    Int
+  teamId       Int
+  competitionId String
+  isHome       Boolean
+
+  goalsScored     Int     @default(0)
+  goalsConceded   Int     @default(0)
+  goalsFirstHalf  Int     @default(0)
+  goalsSecondHalf Int     @default(0)
+
+  shots           Int     @default(0)
+  shotsOnTarget   Int     @default(0)
+  possessionPct   Float   @default(0)
+  corners         Int     @default(0)
+  fouls           Int     @default(0)
+  offsides        Int     @default(0)
+  yellowCards     Int     @default(0)
+  redCards        Int     @default(0)
+
+  xg              Float   @default(0)
+  xgAgainst       Float   @default(0)
+  xgOpenPlay      Float   @default(0)
+  xgSetPiece      Float   @default(0)
+  xgCounter       Float   @default(0)
+  xgFirstHalf     Float   @default(0)
+  xgSecondHalf    Float   @default(0)
+
+  ppda            Float?
+  progressivePasses Int   @default(0)
+  progressiveCarries Int  @default(0)
+  deepCompletions Int     @default(0)
+
+  tacklesWon      Int     @default(0)
+  interceptions   Int     @default(0)
+  blocks          Int     @default(0)
+  clearances      Int     @default(0)
+
+  cornersWon      Int     @default(0)
+  goalsFromSetPieces Int  @default(0)
+  xgFromSetPieces Float   @default(0)
+
+  xgOverperformance Float @default(0)
+
+  fixture     Fixture     @relation(fields: [fixtureId], references: [id])
+  team        Team        @relation(fields: [teamId], references: [id])
+  competition Competition @relation(fields: [competitionId], references: [id])
+
+  @@unique([fixtureId, teamId])
+}
+
+// ─── PLAYER MATCH STATS ──────────────────────────────────────────
+
+model PlayerMatchStats {
+  id             Int  @id @default(autoincrement())
+  fixtureId      Int
+  playerId       Int
+  teamId         Int
+  competitionId  String
+
+  minutesPlayed  Int     @default(0)
+  started        Boolean @default(false)
+  positionPlayed String?
+
+  goals          Int     @default(0)
+  assists        Int     @default(0)
+  shots          Int     @default(0)
+  shotsOnTarget  Int     @default(0)
+  xg             Float   @default(0)
+  xa             Float   @default(0)
+  keyPasses      Int     @default(0)
+  dribblesCompleted Int  @default(0)
+  tackles        Int     @default(0)
+  interceptions  Int     @default(0)
+  touchesInBox   Int     @default(0)
+
+  fixture     Fixture     @relation(fields: [fixtureId], references: [id])
+  player      Player      @relation(fields: [playerId], references: [id])
+  competition Competition @relation(fields: [competitionId], references: [id])
+
+  @@unique([fixtureId, playerId])
+}
+
+// ─── PLAYER SEASON AGGREGATES ────────────────────────────────────
+
+model PlayerSeasonAgg {
+  id             Int    @id @default(autoincrement())
+  playerId       Int
+  competitionId  String
+  season         String
+
+  matches        Int    @default(0)
+  minutes        Int    @default(0)
+  starts         Int    @default(0)
+  goals          Int    @default(0)
+  assists        Int    @default(0)
+  xg             Float  @default(0)
+  xa             Float  @default(0)
+  goalsPer90     Float  @default(0)
+  xgPer90        Float  @default(0)
+  xaPer90        Float  @default(0)
+  shotConversion Float  @default(0)
+  isPenaltyTaker Boolean @default(false)
+  penaltiesScored Int   @default(0)
+  penaltiesMissed Int   @default(0)
+
+  player      Player      @relation(fields: [playerId], references: [id])
+  competition Competition @relation(fields: [competitionId], references: [id])
+
+  @@unique([playerId, competitionId, season])
+}
+
+// ─── INJURIES & AVAILABILITY ─────────────────────────────────────
+
+model Injury {
+  id             Int      @id @default(autoincrement())
+  playerId       Int
+  teamId         Int
+  type           String
+  bodyPart       String?
+  severity       String?
+  dateReported   DateTime @default(now())
+  expectedReturn String?
+  actualReturn   String?
+  status         String   @default("out")
+  source         String?
+  updatedAt      DateTime @default(now())
+
+  player Player @relation(fields: [playerId], references: [id])
+  team   Team   @relation(fields: [teamId], references: [id])
+}
+
+// ─── HEAD TO HEAD CACHE ──────────────────────────────────────────
+
+model H2HMatch {
+  id            Int      @id @default(autoincrement())
+  teamAId       Int
+  teamBId       Int
+  fixtureId     Int?
+  date          DateTime
+  competitionId String?
+  homeTeamId    Int?
+  scoreA        Int
+  scoreB        Int
+  xgA           Float?
+  xgB           Float?
+
+  teamA       Team         @relation("H2HTeamA", fields: [teamAId], references: [id])
+  teamB       Team         @relation("H2HTeamB", fields: [teamBId], references: [id])
+  competition Competition? @relation(fields: [competitionId], references: [id])
+
+  @@unique([teamAId, teamBId, date])
+}
+
+// ─── COACHING & TACTICAL ─────────────────────────────────────────
+
+model Coach {
+  id               Int     @id @default(autoincrement())
+  name             String
+  teamId           Int
+  competitionId    String?
+  appointedDate    String?
+  formationPrimary String?
+  tacticalStyle    String?
+
+  team        Team         @relation(fields: [teamId], references: [id])
+  competition Competition? @relation(fields: [competitionId], references: [id])
+
+  @@unique([teamId])
+}
+
+// ─── TEAM SEASON STATS (aggregated) ──────────────────────────────
+
+model TeamSeasonStats {
+  id              Int    @id @default(autoincrement())
+  teamId          Int
+  competitionId   String
+  season          String
+
+  matchesPlayed   Int    @default(0)
+  wins            Int    @default(0)
+  draws           Int    @default(0)
+  losses          Int    @default(0)
+  points          Int    @default(0)
+  position        Int?
+
+  goalsScored     Int    @default(0)
+  goalsConceded   Int    @default(0)
+  goalsHome       Int    @default(0)
+  goalsAway       Int    @default(0)
+  concededHome    Int    @default(0)
+  concededAway    Int    @default(0)
+
+  xgFor           Float  @default(0)
+  xgAgainst       Float  @default(0)
+  xgHome          Float  @default(0)
+  xgAway          Float  @default(0)
+
+  cleanSheets     Int    @default(0)
+  bttsCount       Int    @default(0)
+  over25Count     Int    @default(0)
+
+  form            String @default("")
+
+  matchesPlayedHome Int  @default(0)
+  matchesPlayedAway Int  @default(0)
+
+  team          Team        @relation(fields: [teamId], references: [id])
+  competition   Competition @relation(fields: [competitionId], references: [id])
+
+  @@unique([teamId, competitionId, season])
+}
+
+// ─── SITUATIONAL STATS ───────────────────────────────────────────
+
+model TeamSituationalStats {
+  id              Int    @id @default(autoincrement())
+  teamId          Int
+  competitionId   String
+  season          String
+
+  winPctScoringFirst    Float @default(0)
+  winPctConcedingFirst  Float @default(0)
+
+  goalsScoredLeading    Int   @default(0)
+  goalsScoredTrailing   Int   @default(0)
+  goalsScoredDrawing    Int   @default(0)
+
+  goals0to15      Int @default(0)
+  goals16to30     Int @default(0)
+  goals31to45     Int @default(0)
+  goals46to60     Int @default(0)
+  goals61to75     Int @default(0)
+  goals76to90     Int @default(0)
+
+  conceded0to15   Int @default(0)
+  conceded16to30  Int @default(0)
+  conceded31to45  Int @default(0)
+  conceded46to60  Int @default(0)
+  conceded61to75  Int @default(0)
+  conceded76to90  Int @default(0)
+
+  avgDaysBetweenMatches Float @default(0)
+  winPctShortRest       Float @default(0)
+  winPctAfterEuropean   Float @default(0)
+
+  homeWinPct      Float @default(0)
+  awayWinPct      Float @default(0)
+  homeGoalsAvg    Float @default(0)
+  awayGoalsAvg    Float @default(0)
+  homeXgAvg       Float @default(0)
+  awayXgAvg       Float @default(0)
+  homeConcededAvg Float @default(0)
+  awayConcededAvg Float @default(0)
+
+  team          Team        @relation(fields: [teamId], references: [id])
+  competition   Competition @relation(fields: [competitionId], references: [id])
+
+  @@unique([teamId, competitionId, season])
+}
+
+// ─── PREDICTIONS ─────────────────────────────────────────────────
+
+model Prediction {
+  id              Int      @id @default(autoincrement())
+  fixtureId       Int
+  competitionId   String
+  modelVersion    String   @default("v1")
+  createdAt       DateTime @default(now())
+
+  probHomeWin     Float    @default(0)
+  probDraw        Float    @default(0)
+  probAwayWin     Float    @default(0)
+
+  expectedTotalGoals Float @default(0)
+  lambdaHome      Float    @default(0)
+  lambdaAway      Float    @default(0)
+
+  probOver05      Float    @default(0)
+  probOver15      Float    @default(0)
+  probOver25      Float    @default(0)
+  probOver35      Float    @default(0)
+  probOver45      Float    @default(0)
+
+  probBttsYes     Float    @default(0)
+  probBttsNo      Float    @default(0)
+
+  probHomeCs      Float    @default(0)
+  probAwayCs      Float    @default(0)
+
+  scorelineProbabilities String @default("{}")
+  htFtProbabilities      String @default("{}")
+  featureWeights         String @default("{}")
+
+  modelConfidence Float    @default(0)
+  topInsights     String   @default("[]")
+
+  fixture     Fixture     @relation(fields: [fixtureId], references: [id])
+  competition Competition @relation(fields: [competitionId], references: [id])
+
+  @@unique([fixtureId, modelVersion])
+}
+
+// ─── DATA REFRESH LOG ────────────────────────────────────────────
+
+model DataRefreshLog {
+  id        Int      @id @default(autoincrement())
+  timestamp DateTime @default(now())
+  source    String
+  status    String
+  message   String?
+  count     Int      @default(0)
+}
