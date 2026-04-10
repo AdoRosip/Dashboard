@@ -1,4 +1,5 @@
 import { prisma } from "./db";
+import { CURRENT_SEASON } from "./constants";
 
 const BUCKETS = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
@@ -14,6 +15,7 @@ function bucketFor(p: number): { low: number; high: number; mid: number } {
 
 /**
  * Log probability vs outcome for finished fixtures using stored Prediction rows.
+ * Buckets use league = competition id per fixture (not only "all"); Platt scaling per league remains future work.
  */
 export async function runCalibrationForFinishedFixtures(): Promise<void> {
   const done = await prisma.fixture.findMany({
@@ -32,6 +34,8 @@ export async function runCalibrationForFinishedFixtures(): Promise<void> {
       orderBy: { createdAt: "desc" },
     });
     if (!pred) continue;
+
+    const league = f.competitionId;
 
     const hs = f.scoreHomeFt ?? 0;
     const as = f.scoreAwayFt ?? 0;
@@ -73,8 +77,8 @@ export async function runCalibrationForFinishedFixtures(): Promise<void> {
       const existing = await prisma.calibrationBucket.findFirst({
         where: {
           market: row.m,
-          league: "all",
-          season: "2025",
+          league,
+          season: CURRENT_SEASON,
           probBucketLow: low,
           probBucketHigh: high,
         },
@@ -96,8 +100,8 @@ export async function runCalibrationForFinishedFixtures(): Promise<void> {
         await prisma.calibrationBucket.create({
           data: {
             market: row.m,
-            league: "all",
-            season: "2025",
+            league,
+            season: CURRENT_SEASON,
             probBucketLow: low,
             probBucketHigh: high,
             probBucketMid: mid,

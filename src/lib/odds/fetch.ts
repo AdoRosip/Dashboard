@@ -88,45 +88,110 @@ async function fetchSportOdds(sportKey: string): Promise<OddsEvent[]> {
   return res.json() as Promise<OddsEvent[]>;
 }
 
-async function ensureOpeningSnapshot(
-  fixtureId: number,
-  bookmaker: string,
-  market: string,
-): Promise<boolean> {
-  const existing = await prisma.oddsSnapshot.findFirst({
-    where: { fixtureId, bookmaker, market, snapshotType: "opening" },
-  });
-  return !existing;
+/** Raw bookmaker margin: sum of implied probabilities before de-vig (always ≥ 1). */
+function rawOverround(prices: number[]): number {
+  return prices.reduce((s, o) => s + 1 / o, 0);
 }
 
-async function upsertSnapshot(params: {
+async function createOpeningSnapshotIfMissing(params: {
   fixtureId: number;
   bookmaker: string;
   market: string;
-  snapshotType: "opening" | "current" | "closing";
   outcome1: number;
   outcome2: number;
   outcome3?: number | null;
-  implied: number[];
 }) {
-  const { fixtureId, bookmaker, market, snapshotType, outcome1, outcome2, outcome3, implied } =
-    params;
-  const overround = implied.reduce((a, b) => a + b, 0);
+  const exists = await prisma.oddsSnapshot.findFirst({
+    where: {
+      fixtureId: params.fixtureId,
+      bookmaker: params.bookmaker,
+      market: params.market,
+      snapshotType: "opening",
+    },
+  });
+  if (exists) return;
+
+  const prices =
+    params.outcome3 != null && params.outcome3 > 0
+      ? [params.outcome1, params.outcome2, params.outcome3]
+      : [params.outcome1, params.outcome2];
+  const implied = removeMargin(prices);
+  const overround = rawOverround(prices);
+
   await prisma.oddsSnapshot.create({
     data: {
-      fixtureId,
-      bookmaker,
-      market,
-      snapshotType,
-      outcome1,
-      outcome2,
-      outcome3: outcome3 ?? null,
+      fixtureId: params.fixtureId,
+      bookmaker: params.bookmaker,
+      market: params.market,
+      snapshotType: "opening",
+      outcome1: params.outcome1,
+      outcome2: params.outcome2,
+      outcome3: params.outcome3 ?? null,
       overround,
       impliedProb1: implied[0] ?? 0,
       impliedProb2: implied[1] ?? 0,
       impliedProb3: implied.length > 2 ? implied[2] ?? null : null,
     },
   });
+}
+
+async function upsertCurrentSnapshot(params: {
+  fixtureId: number;
+  bookmaker: string;
+  market: string;
+  outcome1: number;
+  outcome2: number;
+  outcome3?: number | null;
+}) {
+  const prices =
+    params.outcome3 != null && params.outcome3 > 0
+      ? [params.outcome1, params.outcome2, params.outcome3]
+      : [params.outcome1, params.outcome2];
+  const implied = removeMargin(prices);
+  const overround = rawOverround(prices);
+
+  const payload = {
+    outcome1: params.outcome1,
+    outcome2: params.outcome2,
+    outcome3: params.outcome3 ?? null,
+    overround,
+    impliedProb1: implied[0] ?? 0,
+    impliedProb2: implied[1] ?? 0,
+    impliedProb3: implied.length > 2 ? implied[2] ?? null : null,
+    fetchedAt: new Date(),
+  };
+
+  const existing = await prisma.oddsSnapshot.findFirst({
+    where: {
+      fixtureId: params.fixtureId,
+      bookmaker: params.bookmaker,
+      market: params.market,
+      snapshotType: "current",
+    },
+  });
+
+  if (existing) {
+    await prisma.oddsSnapshot.update({ where: { id: existing.id }, data: payload });
+    await prisma.oddsSnapshot.deleteMany({
+      where: {
+        fixtureId: params.fixtureId,
+        bookmaker: params.bookmaker,
+        market: params.market,
+        snapshotType: "current",
+        NOT: { id: existing.id },
+      },
+    });
+  } else {
+    await prisma.oddsSnapshot.create({
+      data: {
+        fixtureId: params.fixtureId,
+        bookmaker: params.bookmaker,
+        market: params.market,
+        snapshotType: "current",
+        ...payload,
+      },
+    });
+  }
 }
 
 /** Order: outcome1 home, outcome2 draw, outcome3 away */
@@ -169,29 +234,21 @@ async function processH2hBookmaker(
   const ordered = orderH2hPrices(homeTeamName, awayTeamName, m.outcomes);
   if (!ordered) return;
 
-  const implied = removeMargin(ordered);
-  const isFirst = await ensureOpeningSnapshot(fixtureId, bookmaker.key, "1x2");
-  if (isFirst) {
-    await upsertSnapshot({
-      fixtureId,
-      bookmaker: bookmaker.key,
-      market: "1x2",
-      snapshotType: "opening",
-      outcome1: ordered[0],
-      outcome2: ordered[1],
-      outcome3: ordered[2],
-      implied,
-    });
-  }
-  await upsertSnapshot({
+  await createOpeningSnapshotIfMissing({
     fixtureId,
     bookmaker: bookmaker.key,
     market: "1x2",
-    snapshotType: "current",
     outcome1: ordered[0],
     outcome2: ordered[1],
     outcome3: ordered[2],
-    implied,
+  });
+  await upsertCurrentSnapshot({
+    fixtureId,
+    bookmaker: bookmaker.key,
+    market: "1x2",
+    outcome1: ordered[0],
+    outcome2: ordered[1],
+    outcome3: ordered[2],
   });
 }
 
@@ -212,63 +269,19 @@ function extractTotals25(bookmaker: OddsBookmaker): { over: number; under: numbe
 async function processTotalsBookmaker(fixtureId: number, bookmaker: OddsBookmaker) {
   const t = extractTotals25(bookmaker);
   if (!t) return;
-  const implied = removeMargin([t.over, t.under]);
-  const isFirst = await ensureOpeningSnapshot(fixtureId, bookmaker.key, "over_under_25");
-  if (isFirst) {
-    await upsertSnapshot({
-      fixtureId,
-      bookmaker: bookmaker.key,
-      market: "over_under_25",
-      snapshotType: "opening",
-      outcome1: t.over,
-      outcome2: t.under,
-      implied,
-    });
-  }
-  await upsertSnapshot({
+  await createOpeningSnapshotIfMissing({
     fixtureId,
     bookmaker: bookmaker.key,
     market: "over_under_25",
-    snapshotType: "current",
     outcome1: t.over,
     outcome2: t.under,
-    implied,
   });
-}
-
-function extractBtts(bookmaker: OddsBookmaker): { yes: number; no: number } | null {
-  const m = bookmaker.markets.find((x) => x.key === "btts");
-  if (!m) return null;
-  const yes = m.outcomes.find((o) => o.name === "Yes" || /yes/i.test(o.name));
-  const no = m.outcomes.find((o) => o.name === "No" || /no/i.test(o.name));
-  if (!yes || !no) return null;
-  return { yes: yes.price, no: no.price };
-}
-
-async function processBttsBookmaker(fixtureId: number, bookmaker: OddsBookmaker) {
-  const b = extractBtts(bookmaker);
-  if (!b) return;
-  const implied = removeMargin([b.yes, b.no]);
-  const isFirst = await ensureOpeningSnapshot(fixtureId, bookmaker.key, "btts");
-  if (isFirst) {
-    await upsertSnapshot({
-      fixtureId,
-      bookmaker: bookmaker.key,
-      market: "btts",
-      snapshotType: "opening",
-      outcome1: b.yes,
-      outcome2: b.no,
-      implied,
-    });
-  }
-  await upsertSnapshot({
+  await upsertCurrentSnapshot({
     fixtureId,
     bookmaker: bookmaker.key,
-    market: "btts",
-    snapshotType: "current",
-    outcome1: b.yes,
-    outcome2: b.no,
-    implied,
+    market: "over_under_25",
+    outcome1: t.over,
+    outcome2: t.under,
   });
 }
 
@@ -321,7 +334,6 @@ export async function refreshOddsForUpcomingFixtures(days = 7): Promise<FetchOdd
       for (const bm of ev.bookmakers) {
         await processH2hBookmaker(fx.id, ev.home_team, ev.away_team, bm);
         await processTotalsBookmaker(fx.id, bm);
-        await processBttsBookmaker(fx.id, bm);
       }
     }
 

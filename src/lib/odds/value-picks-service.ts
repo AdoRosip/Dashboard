@@ -47,8 +47,6 @@ export async function recomputeValuePicksForUpcoming(days = 7): Promise<number> 
       { key: "1x2_away", modelProb: pred.probAwayWin, pickOutcome: "3" },
       { key: "over25", modelProb: pred.probOver25, pickOutcome: "1" },
       { key: "under25", modelProb: 1 - pred.probOver25, pickOutcome: "2" },
-      { key: "btts_yes", modelProb: pred.probBttsYes, pickOutcome: "1" },
-      { key: "btts_no", modelProb: pred.probBttsNo, pickOutcome: "2" },
     ];
 
     for (const m of markets) {
@@ -75,8 +73,8 @@ export async function recomputeValuePicksForUpcoming(days = 7): Promise<number> 
                 : s.impliedProb3 ?? s.impliedProb2;
           return { bookmaker: s.bookmaker, odds, implied: imp };
         });
-        const best = perBm.reduce((a, b) => (b.odds > a.odds ? b : a), perBm[0]);
-        if (!best) continue;
+        if (perBm.length === 0) continue;
+        const best = perBm.reduce((a, b) => (b.odds > a.odds ? b : a), perBm[0]!);
         dbMarket = m.key;
         impliedProb = best.implied;
         bestOdds = best.odds;
@@ -90,21 +88,7 @@ export async function recomputeValuePicksForUpcoming(days = 7): Promise<number> 
           odds: wantOver ? s.outcome1 : s.outcome2,
           implied: wantOver ? s.impliedProb1 : s.impliedProb2,
         }));
-        const best = perBm.reduce((a, b) => (b.odds > a.odds ? b : a), perBm[0]);
-        dbMarket = m.key;
-        impliedProb = best.implied;
-        bestOdds = best.odds;
-        bestBook = best.bookmaker;
-      } else if (m.key.startsWith("btts")) {
-        const list = byMarket.get("btts") ?? [];
-        if (list.length === 0) continue;
-        const wantYes = m.key === "btts_yes";
-        const perBm = list.map((s) => ({
-          bookmaker: s.bookmaker,
-          odds: wantYes ? s.outcome1 : s.outcome2,
-          implied: wantYes ? s.impliedProb1 : s.impliedProb2,
-        }));
-        const best = perBm.reduce((a, b) => (b.odds > a.odds ? b : a), perBm[0]);
+        const best = perBm.reduce((a, b) => (b.odds > a.odds ? b : a), perBm[0]!);
         dbMarket = m.key;
         impliedProb = best.implied;
         bestOdds = best.odds;

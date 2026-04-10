@@ -32,6 +32,9 @@ export function computeStartingProbability(input: RotationInput): number {
   if (input.nextMatchImportance === "knockout_european" && input.thisMatchImportance === "mid_table") {
     p *= 0.55;
   }
+  if (input.nextMatchImportance === "european_group" && input.thisMatchImportance === "mid_table") {
+    p *= 0.92;
+  }
   if (input.nextMatchImportance === "knockout_european" && input.thisMatchImportance === "title_race") {
     p *= 0.85;
   }
@@ -45,11 +48,18 @@ export function computeStartingProbability(input: RotationInput): number {
   if (input.deadRubber) p *= 0.4;
 
   if (input.isKeyPlayer) {
-    const anyFatigue =
-      input.minutesLast7Days > 180 ||
+    const heavyLoadOrShortRest =
+      (input.minutesLast7Days > 180 && input.daysUntilThisMatch <= 3) ||
       input.minutesLast7Days > 270 ||
       (input.playedFull90LastMatch && input.daysUntilThisMatch <= 2);
-    if (!anyFatigue || p >= 0.5) {
+    const strategicRotationRisk =
+      (input.lastMatchWasEuropeanAway && input.daysUntilThisMatch <= 3) ||
+      input.deadRubber ||
+      (input.nextMatchImportance === "knockout_european" &&
+        input.thisMatchImportance === "mid_table") ||
+      (input.nextMatchImportance === "european_group" &&
+        input.thisMatchImportance === "mid_table");
+    if (!heavyLoadOrShortRest && !strategicRotationRisk) {
       p = Math.max(p, 0.65);
     }
   }

@@ -33,6 +33,20 @@ async function nextFixtureAfter(teamId: number, after: Date) {
   });
 }
 
+/**
+ * Distinguish UEL/UCL group stage (typically MD 1–6) from knockout rounds.
+ * Knockout-only rotation stress should not apply to routine group fixtures.
+ */
+function nextEuropeanMatchImportance(
+  next: { competitionId: string; matchday: number | null } | null,
+): string | null {
+  if (!next || !EURO.has(next.competitionId)) return null;
+  const md = next.matchday;
+  if (md == null) return "european_unknown";
+  if (md <= 6) return "european_group";
+  return "knockout_european";
+}
+
 export async function refreshV2ForUpcomingFixtures(aheadDays = 7) {
   const now = new Date();
   const end = new Date(now.getTime() + aheadDays * 24 * 60 * 60 * 1000);
@@ -107,10 +121,7 @@ async function upsertAvailabilitiesForTeam(
     ? (next.utcDate.getTime() - fixtureDate.getTime()) / (1000 * 60 * 60 * 24)
     : null;
 
-  let nextImp: string | null = null;
-  if (next && EURO.has(next.competitionId)) {
-    nextImp = "knockout_european";
-  }
+  const nextImp = nextEuropeanMatchImportance(next);
 
   for (const pl of players) {
     const agg = pl.seasonAgg[0];
