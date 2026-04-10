@@ -414,6 +414,10 @@ export interface LambdaInputs {
   h2hModifier: number;
   /** ~0.95 if short rest / European midweek, 1.0 otherwise */
   fatigueModifier: number;
+  /** ~0.92–1.08 from match stakes / motivation model */
+  motivationModifier?: number;
+  /** ~0.80–1.15 manual context flags (combined product) */
+  contextModifier?: number;
   /** ~0.95 if overperforming xG, ~1.05 if underperforming (clamped [0.75,1.25]) */
   regressionModifier: number;
 }
@@ -436,6 +440,8 @@ export function computeLambda(inputs: LambdaInputs): number {
   lambda *= inputs.formModifier;
   lambda *= inputs.h2hModifier;
   lambda *= inputs.fatigueModifier;
+  if (inputs.motivationModifier != null) lambda *= inputs.motivationModifier;
+  if (inputs.contextModifier != null) lambda *= inputs.contextModifier;
   lambda *= inputs.regressionModifier;
 
   return Math.max(0.3, Math.min(5.0, lambda));

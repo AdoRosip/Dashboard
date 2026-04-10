@@ -11,7 +11,9 @@
     "db:push": "npx prisma db push",
     "db:seed": "npx tsx src/lib/seed.ts",
     "ingest": "npx tsx src/lib/ingest.ts",
-    "ingest:understat": "npx tsx src/lib/scrapers/understat-ingest.ts"
+    "ingest:understat": "npx tsx src/lib/scrapers/understat-ingest.ts",
+    "betting:settle": "npx tsx src/scripts/settle-betting.ts",
+    "calibration:run": "npx tsx src/scripts/run-calibration.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

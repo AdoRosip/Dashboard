@@ -53,6 +53,11 @@ model Team {
   situationalStats TeamSituationalStats[]
   coaches          Coach[]
   injuries         Injury[]
+
+  playerAvailabilities   PlayerAvailability[]
+  teamFixtureCongestions TeamFixtureCongestion[]
+  matchImportances       MatchImportance[]
+  matchContextFlags      MatchContextFlag[]
 }
 
 model Player {
@@ -73,6 +78,7 @@ model Player {
   matchStats   PlayerMatchStats[]
   seasonAgg    PlayerSeasonAgg[]
   injuries     Injury[]
+  availabilities PlayerAvailability[]
 }
 
 // ─── MATCH DATA ──────────────────────────────────────────────────
@@ -100,6 +106,13 @@ model Fixture {
   teamMatchStats TeamMatchStats[]
   playerMatchStats PlayerMatchStats[]
   predictions    Prediction[]
+
+  playerAvailabilities   PlayerAvailability[]
+  teamFixtureCongestions TeamFixtureCongestion[]
+  matchImportances       MatchImportance[]
+  matchContextFlags      MatchContextFlag[]
+  oddsSnapshots          OddsSnapshot[]
+  valuePicks             ValuePick[]
 }
 
 // ─── GRANULAR TEAM STATS (per team per match) ────────────────────
@@ -418,4 +431,256 @@ model DataRefreshLog {
   status    String
   message   String?
   count     Int      @default(0)
+}
+
+// ─── V2: LINEUP / ROTATION ───────────────────────────────────────
+
+model PlayerAvailability {
+  id              Int      @id @default(autoincrement())
+  playerId        Int
+  fixtureId       Int
+  teamId          Int
+
+  probStarting    Float    @default(0.5)
+  probInSquad     Float    @default(0.85)
+  reason          String   @default("fit")
+
+  minutesLast7Days    Int   @default(0)
+  minutesLast14Days   Int   @default(0)
+  matchesLast7Days    Int   @default(0)
+  daysUntilNextMatch  Int?
+  nextMatchImportance String?
+  travelDistanceLast3 Int   @default(0)
+  playerAge           Int?
+
+  updatedAt       DateTime @default(now())
+
+  player   Player  @relation(fields: [playerId], references: [id])
+  team     Team    @relation(fields: [teamId], references: [id])
+  fixture  Fixture @relation(fields: [fixtureId], references: [id])
+
+  @@unique([playerId, fixtureId])
+}
+
+// ─── V2: CONGESTION & FATIGUE ────────────────────────────────────
+
+model TeamFixtureCongestion {
+  id              Int      @id @default(autoincrement())
+  teamId          Int
+  fixtureId       Int
+  season          String
+
+  matchesLast7Days     Int   @default(0)
+  matchesLast14Days    Int   @default(0)
+  matchesLast21Days    Int   @default(0)
+  minutesKeyPlayersLast14Days Float @default(0)
+
+  awayMatchesLast14Days Int  @default(0)
+  europeanAwayTripsLast14Days Int @default(0)
+  estimatedTravelKmLast14Days Int @default(0)
+
+  congestionScore      Float @default(0)
+  fatigueModifier      Float @default(1.0)
+  daysSinceLastMatch   Float @default(7)
+
+  updatedAt DateTime @default(now())
+
+  team    Team    @relation(fields: [teamId], references: [id])
+  fixture Fixture @relation(fields: [fixtureId], references: [id])
+
+  @@unique([teamId, fixtureId])
+}
+
+// ─── V2: MOTIVATION & IMPORTANCE ─────────────────────────────────
+
+model MatchImportance {
+  id              Int      @id @default(autoincrement())
+  teamId          Int
+  fixtureId       Int
+
+  leaguePosition       Int?
+  pointsFromSafety     Int?
+  pointsFromTop4       Int?
+  pointsFromTitle      Int?
+  matchdayNumber       Int?
+  remainingMatches     Int?
+  competitionStage     String?
+  isKnockout           Boolean @default(false)
+  isDerby              Boolean @default(false)
+  isRivalry            Boolean @default(false)
+
+  titleRace            Boolean @default(false)
+  top4Race             Boolean @default(false)
+  relegationBattle     Boolean @default(false)
+  nothingToPlayFor     Boolean @default(false)
+  alreadyEliminated    Boolean @default(false)
+  alreadyQualified     Boolean @default(false)
+
+  nextMatchFixtureId      Int?
+  nextMatchIsHigherStakes Boolean @default(false)
+  daysBetweenMatches      Float?
+
+  motivationScore   Float @default(0.5)
+  lambdaModifier    Float @default(1.0)
+
+  team    Team    @relation(fields: [teamId], references: [id])
+  fixture Fixture @relation(fields: [fixtureId], references: [id])
+
+  @@unique([teamId, fixtureId])
+}
+
+// ─── V2: MANUAL CONTEXT FLAGS ──────────────────────────────────
+
+model MatchContextFlag {
+  id           Int      @id @default(autoincrement())
+  teamId       Int?
+  fixtureId    Int?
+  competitionId String?
+
+  flagType     String
+  severity     String   @default("moderate")
+  description  String?
+  source       String?
+
+  lambdaMultiplier  Float    @default(1.0)
+  expiresAt         DateTime?
+  isActive          Boolean @default(true)
+
+  createdAt    DateTime @default(now())
+
+  team    Team?    @relation(fields: [teamId], references: [id])
+  fixture Fixture? @relation(fields: [fixtureId], references: [id])
+}
+
+// ─── V2: ODDS & VALUE ───────────────────────────────────────────
+
+model OddsSnapshot {
+  id              Int      @id @default(autoincrement())
+  fixtureId       Int
+  bookmaker       String
+  market          String
+  snapshotType    String
+
+  outcome1        Float
+  outcome2        Float
+  outcome3        Float?
+
+  overround       Float    @default(0)
+  impliedProb1    Float    @default(0)
+  impliedProb2    Float    @default(0)
+  impliedProb3    Float?
+
+  fetchedAt       DateTime @default(now())
+
+  fixture  Fixture @relation(fields: [fixtureId], references: [id])
+
+  @@index([fixtureId, market, bookmaker])
+}
+
+model ValuePick {
+  id              Int      @id @default(autoincrement())
+  fixtureId       Int
+  market          String
+
+  modelProb       Float
+  modelConfidence Float
+
+  bestOdds        Float
+  bestBookmaker   String
+  impliedProb     Float
+
+  edge            Float
+  edgePct         Float
+
+  kellyFraction   Float
+  quarterKelly    Float
+  halfKelly       Float
+
+  rating          Int      @default(1)
+  ratingLabel     String   @default("speculative")
+
+  closingOdds     Float?
+  closingImplied  Float?
+  closingLineValue Float?
+
+  outcome         String?
+  profitLoss      Float?
+  settled         Boolean  @default(false)
+
+  flaggedAt       DateTime @default(now())
+  settledAt       DateTime?
+
+  fixture  Fixture @relation(fields: [fixtureId], references: [id])
+
+  @@index([fixtureId])
+  @@index([flaggedAt])
+  @@index([market])
+}
+
+model BettingPerformance {
+  id              Int      @id @default(autoincrement())
+  period          String
+  market          String
+  league          String   @default("all")
+
+  totalPicks      Int      @default(0)
+  wins            Int      @default(0)
+  losses          Int      @default(0)
+  voids           Int      @default(0)
+
+  totalStaked     Float    @default(0)
+  totalReturn     Float    @default(0)
+  profitLoss      Float    @default(0)
+  roi             Float    @default(0)
+
+  avgEdge         Float    @default(0)
+  avgClosingLineValue Float @default(0)
+  brierScore      Float    @default(0)
+
+  hitRate         Float    @default(0)
+  avgOdds         Float    @default(0)
+
+  highConvictionPicks   Int @default(0)
+  highConvictionWins    Int @default(0)
+  highConvictionROI     Float @default(0)
+
+  updatedAt DateTime @default(now())
+
+  @@unique([period, market, league])
+}
+
+// ─── V2: CALIBRATION & AUDIT ───────────────────────────────────
+
+model CalibrationBucket {
+  id                Int    @id @default(autoincrement())
+  market            String
+  league            String @default("all")
+  season            String
+
+  probBucketLow     Float
+  probBucketHigh    Float
+  probBucketMid     Float
+
+  totalPredictions  Int    @default(0)
+  actualHits        Int    @default(0)
+  actualRate        Float  @default(0)
+  calibrationError  Float  @default(0)
+
+  updatedAt DateTime @default(now())
+
+  @@unique([market, league, season, probBucketLow, probBucketHigh])
+}
+
+model PredictionAudit {
+  id              Int      @id @default(autoincrement())
+  fixtureId       Int
+  market          String
+  predictedProb   Float
+  actualOutcome   Boolean
+  brierContribution Float  @default(0)
+  logLoss         Float    @default(0)
+  createdAt       DateTime @default(now())
+
+  @@index([market])
+  @@index([createdAt])
 }

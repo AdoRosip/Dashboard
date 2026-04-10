@@ -6,6 +6,8 @@ import {
   COMPETITION_CODES,
 } from "./constants";
 import { refreshUnderstat } from "./scrapers/understat-ingest";
+import { refreshV2ForUpcomingFixtures } from "./prediction/pipeline-v2";
+import { refreshOddsForUpcomingFixtures, recomputeValuePicksForUpcoming } from "./odds";
 
 // ─── TYPES ───────────────────────────────────────────────────────
 
@@ -551,6 +553,23 @@ export async function refreshAll(options?: {
 
   await computeDerivedStats();
   await buildH2H();
+
+  try {
+    console.log("V2 modifiers (congestion, motivation, availability)...");
+    await refreshV2ForUpcomingFixtures(Math.max(aheadDays, 7));
+  } catch (e) {
+    console.warn("V2 pipeline:", e);
+  }
+
+  if (process.env.ODDS_API_KEY) {
+    try {
+      console.log("Odds API + value picks...");
+      await refreshOddsForUpcomingFixtures(7);
+      await recomputeValuePicksForUpcoming(7);
+    } catch (e) {
+      console.warn("Odds/value:", e);
+    }
+  }
 
   const elapsed = ((Date.now() - start) / 1000).toFixed(1);
   console.log(`=== Refresh complete in ${elapsed}s ===`);

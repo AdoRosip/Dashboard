@@ -24,12 +24,30 @@ export default function RootLayout({
                 Football Analytics
               </span>
             </a>
-            <nav className="ml-8 flex gap-6">
+            <nav className="ml-8 flex flex-wrap gap-4 sm:gap-6">
               <a
                 href="/"
                 className="text-sm text-text-secondary transition-colors hover:text-text-primary"
               >
                 Fixtures
+              </a>
+              <a
+                href="/value-picks"
+                className="text-sm text-text-secondary transition-colors hover:text-text-primary"
+              >
+                Value picks
+              </a>
+              <a
+                href="/model-performance"
+                className="text-sm text-text-secondary transition-colors hover:text-text-primary"
+              >
+                Model performance
+              </a>
+              <a
+                href="/admin/flags"
+                className="text-sm text-text-secondary transition-colors hover:text-text-primary"
+              >
+                Admin
               </a>
             </nav>
           </div>

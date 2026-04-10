@@ -30,6 +30,8 @@ import {
   topScorelines,
   htFtProbs,
 } from "./poisson";
+import { computeSquadStrengthModifier } from "./rotation";
+import { isDerbyOrRivalry } from "../data/rivalries";
 
 export interface PredictionResult {
   fixtureId: number;
@@ -79,7 +81,7 @@ interface FeatureBreakdown {
   tacticalStyle: string;
 }
 
-const MODEL_VERSION = "v1.0-dc-poisson";
+const MODEL_VERSION = "v2.0-dc-poisson";
 const LEAGUE_AVG_XG = 1.35;
 const PREDICTION_CACHE_HOURS = 6;
 
@@ -89,6 +91,34 @@ const HOME_ADVANTAGE_GOALS_BY_LEAGUE: Record<string, number> = {
   PL: 0.22, PD: 0.32, BL1: 0.28, SA: 0.27, FL1: 0.25,
   CL: 0.20, EC: 0.20, CLI: 0.20,
 };
+
+function squadModFromAvailability(
+  players: Array<{
+    id: number;
+    seasonAgg: Array<{ minutes: number; matches: number; xgPer90: number }>;
+  }>,
+  availability: Array<{ playerId: number; probStarting: number }>,
+  teamXgPerGame: number,
+  injuryFallback: number,
+): number {
+  if (availability.length === 0) return injuryFallback;
+  const byId = new Map(availability.map((a) => [a.playerId, a]));
+  const rows: { xgPer90: number; avgMinutesPerGame: number; probStarting: number }[] = [];
+  for (const p of players) {
+    const av = byId.get(p.id);
+    if (!av) continue;
+    const agg = p.seasonAgg[0];
+    if (!agg) continue;
+    const mpg = agg.matches > 0 ? agg.minutes / agg.matches : 90;
+    rows.push({
+      xgPer90: agg.xgPer90,
+      avgMinutesPerGame: mpg,
+      probStarting: av.probStarting,
+    });
+  }
+  if (rows.length < 3) return injuryFallback;
+  return computeSquadStrengthModifier(rows, teamXgPerGame);
+}
 
 export async function predictMatch(fixtureId: number): Promise<PredictionResult> {
   // ── Check cache (Bug 5) ───────────────────────────────────
@@ -133,6 +163,12 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     awaySeasonStats,
     homeMatchStats,
     awayMatchStats,
+    homeCongestion,
+    awayCongestion,
+    homeImportance,
+    awayImportance,
+    homeAvailability,
+    awayAvailability,
   ] = await Promise.all([
     prisma.teamSeasonStats.findFirst({
       where: { teamId: fixture.homeTeamId, competitionId: homeStatsCompId, season: CURRENT_SEASON },
@@ -151,6 +187,64 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
       orderBy: { fixture: { utcDate: "desc" } },
       take: 15,
       include: { fixture: { select: { utcDate: true } } },
+    }),
+    prisma.teamFixtureCongestion.findUnique({
+      where: { teamId_fixtureId: { teamId: fixture.homeTeamId, fixtureId } },
+    }),
+    prisma.teamFixtureCongestion.findUnique({
+      where: { teamId_fixtureId: { teamId: fixture.awayTeamId, fixtureId } },
+    }),
+    prisma.matchImportance.findUnique({
+      where: { teamId_fixtureId: { teamId: fixture.homeTeamId, fixtureId } },
+    }),
+    prisma.matchImportance.findUnique({
+      where: { teamId_fixtureId: { teamId: fixture.awayTeamId, fixtureId } },
+    }),
+    prisma.playerAvailability.findMany({
+      where: { fixtureId, teamId: fixture.homeTeamId },
+    }),
+    prisma.playerAvailability.findMany({
+      where: { fixtureId, teamId: fixture.awayTeamId },
+    }),
+  ]);
+
+  const flagNow = new Date();
+  const [homeContextFlags, awayContextFlags, matchLevelFlags] = await Promise.all([
+    prisma.matchContextFlag.findMany({
+      where: {
+        isActive: true,
+        AND: [
+          { OR: [{ expiresAt: null }, { expiresAt: { gt: flagNow } }] },
+          {
+            OR: [
+              { teamId: fixture.homeTeamId, fixtureId: null },
+              { teamId: fixture.homeTeamId, fixtureId: fixture.id },
+            ],
+          },
+        ],
+      },
+    }),
+    prisma.matchContextFlag.findMany({
+      where: {
+        isActive: true,
+        AND: [
+          { OR: [{ expiresAt: null }, { expiresAt: { gt: flagNow } }] },
+          {
+            OR: [
+              { teamId: fixture.awayTeamId, fixtureId: null },
+              { teamId: fixture.awayTeamId, fixtureId: fixture.id },
+            ],
+          },
+        ],
+      },
+    }),
+    prisma.matchContextFlag.findMany({
+      where: {
+        isActive: true,
+        teamId: null,
+        fixtureId: fixture.id,
+        OR: [{ expiresAt: null }, { expiresAt: { gt: flagNow } }],
+      },
     }),
   ]);
 
@@ -269,16 +363,45 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
   ) / Math.max(awayXgPerGame, 0.01);
   const awayRegression = Math.max(0.75, Math.min(1.25, awayRegressionRaw));
 
-  // Injury modifiers (multiplicative, e.g. 0.85 = missing 15% of xG)
-  const homeInjuryMod = 1 - (homeSquad.missingPlayersXgShare ?? 0);
-  const awayInjuryMod = 1 - (awaySquad.missingPlayersXgShare ?? 0);
+  // Squad / injury: prefer probabilistic rotation model when availability rows exist
+  const homeInjuryFallback = 1 - (homeSquad.missingPlayersXgShare ?? 0);
+  const awayInjuryFallback = 1 - (awaySquad.missingPlayersXgShare ?? 0);
 
-  // Form modifiers (trend slope → multiplier, capped ±15%)
-  const motivBoost = contextFeatures.motivationFactor === "high_positive" ? 0.03
-    : contextFeatures.motivationFactor === "high_negative" ? 0.02
-    : 0;
-  const homeFormMod = Math.max(0.85, Math.min(1.15, 1 + (homeForm.formXgTrend ?? 0) * 0.5 + motivBoost));
-  const awayFormMod = Math.max(0.85, Math.min(1.15, 1 + (awayForm.formXgTrend ?? 0) * 0.5 + motivBoost));
+  const homeSquadMod = squadModFromAvailability(
+    homePlayers,
+    homeAvailability,
+    homeXgTotal,
+    homeInjuryFallback,
+  );
+  const awaySquadMod = squadModFromAvailability(
+    awayPlayers,
+    awayAvailability,
+    awayXgTotal,
+    awayInjuryFallback,
+  );
+
+  // Form modifiers (xG trend only — motivation handled via MatchImportance)
+  const homeFormMod = Math.max(0.85, Math.min(1.15, 1 + (homeForm.formXgTrend ?? 0) * 0.5));
+  const awayFormMod = Math.max(0.85, Math.min(1.15, 1 + (awayForm.formXgTrend ?? 0) * 0.5));
+
+  const homeMotivationMod = homeImportance?.lambdaModifier ?? 1.0;
+  const awayMotivationMod = awayImportance?.lambdaModifier ?? 1.0;
+
+  const matchLevelMod = matchLevelFlags.reduce((m, f) => m * f.lambdaMultiplier, 1.0);
+  const homeContextMod = Math.max(
+    0.8,
+    Math.min(
+      1.15,
+      homeContextFlags.reduce((m, f) => m * f.lambdaMultiplier, 1.0) * matchLevelMod,
+    ),
+  );
+  const awayContextMod = Math.max(
+    0.8,
+    Math.min(
+      1.15,
+      awayContextFlags.reduce((m, f) => m * f.lambdaMultiplier, 1.0) * matchLevelMod,
+    ),
+  );
 
   // H2H modifiers (shrunk toward 1.0 by sample size, capped ±10%)
   const h2hWeight = Math.min(1.0, h2hFeatures.totalMeetings / 10);
@@ -287,13 +410,17 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
   const homeH2hMod = Math.max(0.90, Math.min(1.10, 1 + homeH2hAdj * 0.3));
   const awayH2hMod = Math.max(0.90, Math.min(1.10, 1 + awayH2hAdj * 0.3));
 
-  // Fatigue modifiers — both teams checked
+  // Fatigue — graduated congestion model when precomputed rows exist
   const homeDaysSinceLast = contextFeatures.daysSinceLastMatch ?? 7;
   const awayDaysSinceLast = lastAwayDate
     ? (Date.now() - lastAwayDate.getTime()) / (1000 * 60 * 60 * 24)
     : 7;
-  const homeFatigueMod = homeDaysSinceLast < 3 ? 0.95 : 1.0;
-  const awayFatigueMod = awayDaysSinceLast < 3 ? 0.95 : 1.0;
+  const homeFatigueMod =
+    homeCongestion?.fatigueModifier ??
+    (homeDaysSinceLast < 3 ? 0.95 : 1.0);
+  const awayFatigueMod =
+    awayCongestion?.fatigueModifier ??
+    (awayDaysSinceLast < 3 ? 0.95 : 1.0);
 
   // Compute final lambdas
   const lambdaHome = computeLambda({
@@ -301,10 +428,12 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     opponentDefenseRating: awayXgaPerGame,
     isHome: true,
     homeAdvantageGoals: homeAdvGoals,
-    injuryModifier: homeInjuryMod,
+    injuryModifier: homeSquadMod,
     formModifier: homeFormMod,
     h2hModifier: homeH2hMod,
     fatigueModifier: homeFatigueMod,
+    motivationModifier: homeMotivationMod,
+    contextModifier: homeContextMod,
     regressionModifier: homeRegression,
   });
 
@@ -313,18 +442,23 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     opponentDefenseRating: homeXgaPerGame,
     isHome: false,
     homeAdvantageGoals: homeAdvGoals,
-    injuryModifier: awayInjuryMod,
+    injuryModifier: awaySquadMod,
     formModifier: awayFormMod,
     h2hModifier: awayH2hMod,
     fatigueModifier: awayFatigueMod,
+    motivationModifier: awayMotivationMod,
+    contextModifier: awayContextMod,
     regressionModifier: awayRegression,
   });
 
   // ── Build predictions ──────────────────────────────────────
 
-  const rho = tactical.styleClash === "deep_block_vs_deep_block" ? -0.08
-    : tactical.styleClash === "press_vs_press" ? -0.02
-    : -0.05;
+  const derbyRho =
+    isDerbyOrRivalry(fixture.homeTeamId, fixture.awayTeamId).isDerby ? -0.02 : 0;
+  const rho =
+    (tactical.styleClash === "deep_block_vs_deep_block" ? -0.08
+      : tactical.styleClash === "press_vs_press" ? -0.02
+      : -0.05) + derbyRho;
 
   const matrix = buildScorelineMatrix(lambdaHome, lambdaAway, rho);
   const result1x2 = matchResultProbs(matrix);
@@ -402,8 +536,10 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     topScorelines: topLines.map((l) => ({ ...l, prob: round4(l.prob) })),
     modelConfidence: round4(confidence),
     featureWeights: {
-      injuryModifier: round4(homeInjuryMod),
+      squadStrengthModifier: round4(homeSquadMod),
       formModifier: round4(homeFormMod),
+      motivationModifier: round4(homeMotivationMod),
+      contextModifier: round4(homeContextMod),
       h2hModifier: round4(homeH2hMod),
       fatigueModifier: round4(homeFatigueMod),
       regressionModifier: round4(homeRegression),
