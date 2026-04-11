@@ -7,7 +7,12 @@ import {
 } from "./constants";
 import { refreshUnderstat } from "./scrapers/understat-ingest";
 import { refreshV2ForUpcomingFixtures } from "./prediction/pipeline-v2";
-import { refreshOddsForUpcomingFixtures, recomputeValuePicksForUpcoming } from "./odds";
+import {
+  refreshOddsForUpcomingFixtures,
+  recomputeValuePicksForUpcoming,
+} from "./odds";
+import { settleValuePicks } from "./odds/settle";
+import { recomputeBettingPerformance } from "./odds/performance";
 
 // ─── TYPES ───────────────────────────────────────────────────────
 
@@ -569,6 +574,14 @@ export async function refreshAll(options?: {
     } catch (e) {
       console.warn("Odds/value:", e);
     }
+  }
+
+  try {
+    const settled = await settleValuePicks();
+    if (settled > 0) console.log(`Settled ${settled} value pick(s).`);
+    await recomputeBettingPerformance();
+  } catch (e) {
+    console.warn("Betting settlement:", e);
   }
 
   const elapsed = ((Date.now() - start) / 1000).toFixed(1);

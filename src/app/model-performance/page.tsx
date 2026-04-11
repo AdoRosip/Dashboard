@@ -1,15 +1,28 @@
+import Link from "next/link";
 import { prisma } from "@/lib/db";
+import { meanHeadlineBrier } from "@/lib/calibration";
 
 export const dynamic = "force-dynamic";
 
 export default async function ModelPerformancePage() {
-  const [buckets, perf, audits] = await Promise.all([
+  const [buckets, perf, audits, settledPicks] = await Promise.all([
     prisma.calibrationBucket.findMany({ orderBy: [{ market: "asc" }], take: 120 }),
     prisma.bettingPerformance.findMany({ take: 20 }),
     prisma.predictionAudit.findMany({ orderBy: { createdAt: "desc" }, take: 2000 }),
+    prisma.valuePick.findMany({
+      where: { settled: true, outcome: { in: ["win", "loss"] } },
+      orderBy: { settledAt: "desc" },
+      take: 150,
+      include: {
+        fixture: {
+          include: { homeTeam: true, awayTeam: true, competition: true },
+        },
+      },
+    }),
   ]);
 
-  const brier =
+  const brierHeadline = meanHeadlineBrier(audits);
+  const brierAll =
     audits.length > 0
       ? audits.reduce((s, a) => s + a.brierContribution, 0) / audits.length
       : null;
@@ -19,9 +32,11 @@ export default async function ModelPerformancePage() {
       <div>
         <h1 className="text-2xl font-semibold text-text-primary">Model performance</h1>
         <p className="mt-1 text-sm text-text-secondary">
-          Calibration buckets and aggregate error metrics. Run{" "}
-          <code className="rounded bg-bg-card px-1">POST /api/calibration/run</code> to
-          populate from finished fixtures.
+          Calibration buckets and betting results. Run{" "}
+          <code className="rounded bg-bg-card px-1">POST /api/calibration/run</code> for
+          model metrics and <code className="rounded bg-bg-card px-1">npm run betting:settle</code>{" "}
+          (or <code className="rounded bg-bg-card px-1">POST /api/betting/settle</code>) to
+          mark value picks after matches finish.
         </p>
       </div>
 
@@ -29,9 +44,15 @@ export default async function ModelPerformancePage() {
         <h2 className="text-sm font-medium text-text-primary">Summary</h2>
         <dl className="mt-3 grid grid-cols-2 gap-3 text-sm sm:grid-cols-3">
           <div>
-            <dt className="text-text-secondary">Mean Brier (sample)</dt>
+            <dt className="text-text-secondary">Mean Brier (headline)</dt>
             <dd className="font-mono text-text-primary">
-              {brier != null ? brier.toFixed(4) : "—"}
+              {brierHeadline != null ? brierHeadline.toFixed(4) : "—"}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-text-secondary">Mean Brier (all audit rows)</dt>
+            <dd className="font-mono text-text-primary">
+              {brierAll != null ? brierAll.toFixed(4) : "—"}
             </dd>
           </div>
           <div>
@@ -79,6 +100,102 @@ export default async function ModelPerformancePage() {
                     <td className="px-3 py-2 font-mono">{p.totalPicks}</td>
                   </tr>
                 ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h2 className="mb-3 text-sm font-medium text-text-primary">Settled value picks</h2>
+        <p className="mb-3 text-xs text-text-secondary">
+          Each row is one flagged bet (stake = quarter Kelly). P/L is in the same units as stake
+          (e.g. if stake is 2.5% bankroll, profit is a fraction of bankroll).
+        </p>
+        <div className="overflow-x-auto rounded-xl border border-border">
+          <table className="w-full min-w-[960px] text-left text-sm">
+            <thead className="bg-bg-secondary text-xs text-text-secondary">
+              <tr>
+                <th className="px-3 py-2">Match</th>
+                <th className="px-3 py-2">Market</th>
+                <th className="px-3 py-2">Result</th>
+                <th className="px-3 py-2">Score</th>
+                <th className="px-3 py-2">Model</th>
+                <th className="px-3 py-2">Odds</th>
+                <th className="px-3 py-2">Edge</th>
+                <th className="px-3 py-2">Stake (¼K)</th>
+                <th className="px-3 py-2">P/L</th>
+                <th className="px-3 py-2">Settled</th>
+              </tr>
+            </thead>
+            <tbody>
+              {settledPicks.length === 0 ? (
+                <tr>
+                  <td colSpan={10} className="px-3 py-6 text-center text-text-secondary">
+                    No settled picks yet — run odds refresh, then settle after fixtures finish.
+                  </td>
+                </tr>
+              ) : (
+                settledPicks.map((p) => {
+                  const f = p.fixture;
+                  const home = f.homeTeam.shortName ?? f.homeTeam.name;
+                  const away = f.awayTeam.shortName ?? f.awayTeam.name;
+                  const score =
+                    f.scoreHomeFt != null && f.scoreAwayFt != null
+                      ? `${f.scoreHomeFt}–${f.scoreAwayFt}`
+                      : "—";
+                  const won = p.outcome === "win";
+                  return (
+                    <tr key={p.id} className="border-t border-border">
+                      <td className="px-3 py-2">
+                        <Link
+                          href={`/match/${p.fixtureId}`}
+                          className="text-accent hover:underline"
+                        >
+                          {home} vs {away}
+                        </Link>
+                        <div className="text-xs text-text-secondary">{f.competition.name}</div>
+                      </td>
+                      <td className="px-3 py-2 font-mono text-xs">{p.market}</td>
+                      <td className="px-3 py-2">
+                        <span
+                          className={
+                            won
+                              ? "rounded bg-emerald-500/15 px-2 py-0.5 text-emerald-400"
+                              : "rounded bg-red-500/15 px-2 py-0.5 text-red-400"
+                          }
+                        >
+                          {won ? "Hit" : "Miss"}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 font-mono text-xs">{score}</td>
+                      <td className="px-3 py-2 font-mono">{(p.modelProb * 100).toFixed(1)}%</td>
+                      <td className="px-3 py-2 font-mono">{p.bestOdds.toFixed(2)}</td>
+                      <td className="px-3 py-2 font-mono">+{p.edgePct.toFixed(1)}%</td>
+                      <td className="px-3 py-2 font-mono">
+                        {(p.quarterKelly * 100).toFixed(2)}%
+                      </td>
+                      <td
+                        className={`px-3 py-2 font-mono ${
+                          (p.profitLoss ?? 0) >= 0 ? "text-emerald-400" : "text-red-400"
+                        }`}
+                      >
+                        {p.profitLoss != null
+                          ? `${(p.profitLoss * 100).toFixed(2)}%`
+                          : "—"}
+                      </td>
+                      <td className="px-3 py-2 text-xs text-text-secondary">
+                        {p.settledAt
+                          ? p.settledAt.toLocaleDateString(undefined, {
+                              month: "short",
+                              day: "numeric",
+                              year: "numeric",
+                            })
+                          : "—"}
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>

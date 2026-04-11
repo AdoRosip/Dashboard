@@ -92,7 +92,12 @@ async function resolveClosingLine(pick: {
 }
 
 /**
- * Settle unsettled value picks for finished fixtures.
+ * Settle unsettled value picks when full-time scores exist in the DB.
+ *
+ * We do **not** require `status === "FINISHED"` — Football-Data often lags and can leave
+ * `SCHEDULED`/`TIMED` until the next ingest even after the match. If `scoreHomeFt` /
+ * `scoreAwayFt` are present, that is enough to grade the bet (same as the UI using kickoff time).
+ *
  * Over/Under 2.5 lines have no push — exactly 2 goals is Under, not void.
  */
 export async function settleValuePicks(): Promise<number> {
@@ -104,7 +109,8 @@ export async function settleValuePicks(): Promise<number> {
   let n = 0;
   for (const pick of open) {
     const f = pick.fixture;
-    if (f.status !== "FINISHED" || f.scoreHomeFt == null || f.scoreAwayFt == null) continue;
+    if (f.scoreHomeFt == null || f.scoreAwayFt == null) continue;
+    if (f.status === "CANCELLED" || f.status === "POSTPONED") continue;
 
     const h = f.scoreHomeFt;
     const a = f.scoreAwayFt;

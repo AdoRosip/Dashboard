@@ -35,9 +35,10 @@ export function checkValue(input: ValueCheckInput): ValuePickDraft | null {
   if (input.bestOdds < 1.2) return null;
 
   const denom = input.bestOdds - 1;
+  /** Full Kelly fraction of bankroll: (p·O − 1) / (O − 1) for decimal odds O. */
   const kellyRaw =
     denom > 0
-      ? (edge * input.bestOdds - (1 - input.modelProb)) / denom
+      ? (input.modelProb * input.bestOdds - 1) / denom
       : 0;
   const clampedKelly = Math.max(0, Math.min(0.1, kellyRaw));
 
@@ -47,7 +48,14 @@ export function checkValue(input: ValueCheckInput): ValuePickDraft | null {
   if (edge > 0.1 && input.modelConfidence > 0.7) rating = 4;
   if (edge > 0.12 && input.modelConfidence > 0.75) rating = 5;
 
-  const ratingLabels = ["", "speculative", "moderate", "strong", "high_conviction", "high_conviction"];
+  const ratingLabels = [
+    "",
+    "speculative",
+    "moderate",
+    "strong",
+    "very_strong",
+    "max_conviction",
+  ];
 
   return {
     market: input.market,

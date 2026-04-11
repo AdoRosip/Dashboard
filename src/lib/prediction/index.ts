@@ -1,4 +1,9 @@
-export { predictMatch, savePrediction, type PredictionResult } from "./engine";
+export {
+  predictMatch,
+  savePrediction,
+  MODEL_VERSION,
+  type PredictionResult,
+} from "./engine";
 export {
   buildScorelineMatrix,
   matchResultProbs,

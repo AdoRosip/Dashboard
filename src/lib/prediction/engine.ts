@@ -32,6 +32,7 @@ import {
 } from "./poisson";
 import { computeSquadStrengthModifier } from "./rotation";
 import { isDerbyOrRivalry } from "../data/rivalries";
+import { dixonColesRhoBase, htGoalShare } from "./league-params";
 
 export interface PredictionResult {
   fixtureId: number;
@@ -81,7 +82,7 @@ interface FeatureBreakdown {
   tacticalStyle: string;
 }
 
-const MODEL_VERSION = "v2.0-dc-poisson";
+export const MODEL_VERSION = "v2.0-dc-poisson";
 const LEAGUE_AVG_XG = 1.35;
 const PREDICTION_CACHE_HOURS = 6;
 
@@ -128,7 +129,8 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
   });
 
   if (cached) {
-    const ageMs = Date.now() - cached.createdAt.getTime();
+    const refTime = cached.updatedAt ?? cached.createdAt;
+    const ageMs = Date.now() - refTime.getTime();
     if (ageMs < PREDICTION_CACHE_HOURS * 60 * 60 * 1000) {
       return reconstructPredictionResult(cached, fixtureId);
     }
@@ -455,10 +457,13 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
 
   const derbyRho =
     isDerbyOrRivalry(fixture.homeTeamId, fixture.awayTeamId).isDerby ? -0.02 : 0;
+  const rhoBase = dixonColesRhoBase(fixture.competitionId);
   const rho =
-    (tactical.styleClash === "deep_block_vs_deep_block" ? -0.08
-      : tactical.styleClash === "press_vs_press" ? -0.02
-      : -0.05) + derbyRho;
+    (tactical.styleClash === "deep_block_vs_deep_block"
+      ? rhoBase - 0.03
+      : tactical.styleClash === "press_vs_press"
+        ? rhoBase + 0.03
+        : rhoBase) + derbyRho;
 
   const matrix = buildScorelineMatrix(lambdaHome, lambdaAway, rho);
   const result1x2 = matchResultProbs(matrix);
@@ -467,9 +472,14 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
   const cs = cleanSheetProbs(matrix);
   const scorelines = scorelineMap(matrix);
   const topLines = topScorelines(matrix, 10);
-  const htft = htFtProbs(lambdaHome, lambdaAway, rho);
+  const htft = htFtProbs(
+    lambdaHome,
+    lambdaAway,
+    rho,
+    htGoalShare(fixture.competitionId),
+  );
 
-  // Confidence: based on data availability
+  // Confidence: blend data richness with 1X2 sharpness (entropy); not the same as uncertainty.
   let dataPoints = 0;
   if (homeMatchStats.length > 0) dataPoints += homeMatchStats.length * 20;
   if (awayMatchStats.length > 0) dataPoints += awayMatchStats.length * 20;
@@ -480,7 +490,20 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
   if (awayPlayers.length > 0) dataPoints += 50;
 
   const maxDataPoints = 1000;
-  const confidence = Math.min(1, dataPoints / maxDataPoints);
+  const dataQuality = Math.min(1, dataPoints / maxDataPoints);
+  const ph = result1x2.home;
+  const pd = result1x2.draw;
+  const pa = result1x2.away;
+  let entropy = 0;
+  for (const x of [ph, pd, pa]) {
+    if (x > 1e-12) entropy -= x * Math.log(x);
+  }
+  const entropyNorm = entropy / Math.log(3);
+  const sharpness = 1 - entropyNorm;
+  const confidence = Math.min(
+    1,
+    Math.max(0.12, 0.38 * dataQuality + 0.62 * sharpness),
+  );
 
   // ── Generate insights ──────────────────────────────────────
 
@@ -576,6 +599,8 @@ function reconstructPredictionResult(
   cached: {
     fixtureId: number;
     modelVersion: string;
+    createdAt: Date;
+    updatedAt?: Date;
     probHomeWin: number;
     probDraw: number;
     probAwayWin: number;

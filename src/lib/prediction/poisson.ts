@@ -2,11 +2,12 @@
  * Dixon-Coles Adjusted Poisson Model
  *
  * Core goal-prediction model. Takes attack/defense ratings for each team,
- * produces a full scoreline probability matrix (8x8), from which all
+ * produces a full scoreline probability matrix (truncated grid), from which all
  * derivative markets (1X2, O/U, BTTS, CS, HT/FT) are derived.
  */
 
-const MAX_GOALS = 8;
+/** Grid 0..MAX_GOALS-1 goals per side; larger grid reduces tail bias from truncation. */
+const MAX_GOALS = 12;
 
 function poissonPmf(k: number, lambda: number): number {
   if (lambda <= 0) return k === 0 ? 1 : 0;
@@ -158,12 +159,14 @@ export function htFtProbs(
   lambdaHome: number,
   lambdaAway: number,
   rho: number = -0.05,
+  /** Share of λ in first half (league-specific when available). */
+  htGoalShare: number = 0.42,
 ) {
-  const HT_RATIO = 0.42;
-  const lhHt = lambdaHome * HT_RATIO;
-  const laHt = lambdaAway * HT_RATIO;
-  const lhSh = lambdaHome * (1 - HT_RATIO);
-  const laSh = lambdaAway * (1 - HT_RATIO);
+  const share = Math.min(0.48, Math.max(0.38, htGoalShare));
+  const lhHt = lambdaHome * share;
+  const laHt = lambdaAway * share;
+  const lhSh = lambdaHome * (1 - share);
+  const laSh = lambdaAway * (1 - share);
 
   const htMatrix = buildScorelineMatrix(lhHt, laHt, rho * 0.5);
   const shMatrix = buildScorelineMatrix(lhSh, laSh, rho * 0.5);

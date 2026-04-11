@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
+import { meanHeadlineBrier } from "@/lib/calibration";
 
 export async function GET() {
   const [betting, buckets] = await Promise.all([
@@ -12,10 +13,18 @@ export async function GET() {
     take: 500,
   });
 
-  const brier =
+  const headlineBrier = meanHeadlineBrier(audits);
+  const brierAllMarkets =
     audits.length > 0
       ? audits.reduce((s, a) => s + a.brierContribution, 0) / audits.length
-      : 0;
+      : null;
 
-  return NextResponse.json({ betting, buckets, brierScore: brier, auditCount: audits.length });
+  return NextResponse.json({
+    betting,
+    buckets,
+    brierScore: headlineBrier ?? brierAllMarkets,
+    brierScoreAllMarkets: brierAllMarkets,
+    brierScoreHeadline: headlineBrier,
+    auditCount: audits.length,
+  });
 }

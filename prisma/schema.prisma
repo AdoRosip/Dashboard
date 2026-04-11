@@ -387,6 +387,7 @@ model Prediction {
   competitionId   String
   modelVersion    String   @default("v1")
   createdAt       DateTime @default(now())
+  updatedAt       DateTime @default(now()) @updatedAt
 
   probHomeWin     Float    @default(0)
   probDraw        Float    @default(0)
@@ -675,6 +676,7 @@ model PredictionAudit {
   id              Int      @id @default(autoincrement())
   fixtureId       Int
   market          String
+  modelVersion    String   @default("")
   predictedProb   Float
   actualOutcome   Boolean
   brierContribution Float  @default(0)
