@@ -1,8 +1,11 @@
 /**
- * Headline calibration metrics: one multinomial 1x2 row per match, not three Bernoullis.
+ * Headline calibration metrics: per-outcome 1X2 (binary) + O/U + BTTS.
+ * Multinomial Brier helpers below are optional for offline analysis.
  */
 export const HEADLINE_CALIBRATION_MARKETS = new Set([
-  "1x2_multinomial",
+  "1x2_home",
+  "1x2_draw",
+  "1x2_away",
   "over25",
   "btts_yes",
 ]);

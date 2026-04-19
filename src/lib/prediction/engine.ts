@@ -182,13 +182,13 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
       where: { teamId: fixture.homeTeamId },
       orderBy: { fixture: { utcDate: "desc" } },
       take: 15,
-      include: { fixture: { select: { utcDate: true } } },
+      include: { fixture: { select: { utcDate: true, competitionId: true } } },
     }),
     prisma.teamMatchStats.findMany({
       where: { teamId: fixture.awayTeamId },
       orderBy: { fixture: { utcDate: "desc" } },
       take: 15,
-      include: { fixture: { select: { utcDate: true } } },
+      include: { fixture: { select: { utcDate: true, competitionId: true } } },
     }),
     prisma.teamFixtureCongestion.findUnique({
       where: { teamId_fixtureId: { teamId: fixture.homeTeamId, fixtureId } },
@@ -301,8 +301,24 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
   const lastAwayMatch = awayMatchStats[0];
   const lastAwayDate = lastAwayMatch ? new Date(lastAwayMatch.fixture.utcDate) : null;
 
+  const kickoff = new Date(fixture.utcDate);
+  const priorMatchWasEuropean = (
+    stats: typeof homeMatchStats,
+  ): boolean => {
+    const row = stats[0];
+    if (!row?.fixture) return false;
+    const prev = new Date(row.fixture.utcDate);
+    if (prev.getTime() >= kickoff.getTime()) return false;
+    return EUROPEAN_COMPETITIONS.has(row.fixture.competitionId);
+  };
+  const isAfterEuropean =
+    priorMatchWasEuropean(homeMatchStats) || priorMatchWasEuropean(awayMatchStats);
+
   const contextFeatures = computeContextFeatures(
-    homeSeasonStats, awaySeasonStats, lastHomeDate, false,
+    homeSeasonStats,
+    awaySeasonStats,
+    lastHomeDate,
+    isAfterEuropean,
   );
 
   const tactical = classifyTacticalMatchup(

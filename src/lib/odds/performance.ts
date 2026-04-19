@@ -1,4 +1,8 @@
 import { prisma } from "../db";
+import {
+  resolveProfitLossForAggregate,
+  resolveStakeForSettlement,
+} from "./stake-units";
 
 /**
  * Recompute aggregate betting performance from settled ValuePicks.
@@ -21,9 +25,23 @@ export async function recomputeBettingPerformance(): Promise<void> {
       voids++;
       continue;
     }
-    const stake = p.quarterKelly;
+    const stake = resolveStakeForSettlement({
+      stakeUnits: p.stakeUnits,
+      rating: p.rating,
+      modelProb: p.modelProb,
+      bestOdds: p.bestOdds,
+    });
+    const pl = resolveProfitLossForAggregate({
+      stakeUnits: p.stakeUnits,
+      quarterKelly: p.quarterKelly,
+      profitLoss: p.profitLoss,
+      outcome: p.outcome,
+      bestOdds: p.bestOdds,
+      rating: p.rating,
+      modelProb: p.modelProb,
+    });
     totalStaked += stake;
-    totalReturn += stake + (p.profitLoss ?? 0);
+    totalReturn += stake + pl;
     if (p.outcome === "win") wins++;
     else if (p.outcome === "loss") losses++;
     if (p.closingLineValue != null) {

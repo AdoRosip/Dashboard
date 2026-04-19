@@ -1,5 +1,6 @@
 import { prisma } from "../db";
 import { removeMargin } from "./margin";
+import { resolveStakeForSettlement } from "./stake-units";
 
 function outcome1x2(home: number, away: number): "home" | "draw" | "away" {
   if (home > away) return "home";
@@ -127,7 +128,12 @@ export async function settleValuePicks(): Promise<number> {
     else if (pick.market === "btts_yes") won = h > 0 && a > 0;
     else if (pick.market === "btts_no") won = !(h > 0 && a > 0);
 
-    const stake = pick.quarterKelly;
+    const stake = resolveStakeForSettlement({
+      stakeUnits: pick.stakeUnits,
+      rating: pick.rating,
+      modelProb: pick.modelProb,
+      bestOdds: pick.bestOdds,
+    });
     let profitLoss = 0;
     let outcome: string = "loss";
     if (won) {

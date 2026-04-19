@@ -1,3 +1,5 @@
+import { computeStakeUnits } from "./stake-units";
+
 export interface ValueCheckInput {
   market: string;
   modelProb: number;
@@ -18,6 +20,8 @@ export interface ValuePickDraft {
   kellyFraction: number;
   quarterKelly: number;
   halfKelly: number;
+  /** Discrete stake for settlement (see `computeStakeUnits`). */
+  stakeUnits: number;
   rating: number;
   ratingLabel: string;
 }
@@ -26,11 +30,23 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
+/** Kelly fractions can be <1% of bankroll; round2 was zeroing quarterKelly and P/L. */
+function round4(n: number): number {
+  return Math.round(n * 10000) / 10000;
+}
+
+/**
+ * Must stay at or below the prediction engine’s practical ceiling when 1X2 is ~uniform
+ * (`engine.ts`: confidence ≈ 0.38 × dataQuality + 0.62 × sharpness; sharpness → 0 for balanced
+ * matches). A floor of 0.45 made **every** tight match fail this gate with no value picks.
+ */
+const MIN_MODEL_CONFIDENCE_FOR_VALUE = 0.35;
+
 export function checkValue(input: ValueCheckInput): ValuePickDraft | null {
   const edge = input.modelProb - input.impliedProb;
 
   if (edge < 0.03) return null;
-  if (input.modelConfidence < 0.45) return null;
+  if (input.modelConfidence < MIN_MODEL_CONFIDENCE_FOR_VALUE) return null;
   if (input.modelProb < 0.15) return null;
   if (input.bestOdds < 1.2) return null;
 
@@ -57,6 +73,12 @@ export function checkValue(input: ValueCheckInput): ValuePickDraft | null {
     "max_conviction",
   ];
 
+  const stakeUnits = computeStakeUnits({
+    rating,
+    modelProb: input.modelProb,
+    bestOdds: input.bestOdds,
+  });
+
   return {
     market: input.market,
     modelProb: input.modelProb,
@@ -66,9 +88,10 @@ export function checkValue(input: ValueCheckInput): ValuePickDraft | null {
     impliedProb: input.impliedProb,
     edge: round2(edge),
     edgePct: round2(edge * 100),
-    kellyFraction: round2(clampedKelly),
-    quarterKelly: round2(clampedKelly * 0.25),
-    halfKelly: round2(clampedKelly * 0.5),
+    kellyFraction: round4(clampedKelly),
+    quarterKelly: round4(clampedKelly * 0.25),
+    halfKelly: round4(clampedKelly * 0.5),
+    stakeUnits,
     rating,
     ratingLabel: ratingLabels[rating] ?? "speculative",
   };

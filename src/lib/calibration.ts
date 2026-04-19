@@ -1,12 +1,7 @@
 import { prisma } from "./db";
 import { CURRENT_SEASON } from "./constants";
 import { MODEL_VERSION } from "./prediction/engine";
-import {
-  brierScore1x2Multinomial,
-  isHeadlineCalibrationMarket,
-  logLoss1x2Multinomial,
-  outcome1x2FromScore,
-} from "./calibration/metrics";
+import { isHeadlineCalibrationMarket } from "./calibration/metrics";
 
 const BUCKETS = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
@@ -70,7 +65,7 @@ async function upsertCalibrationBucket(params: {
 
 /**
  * Log probability vs outcome for finished fixtures using stored Prediction rows.
- * Uses latest `updatedAt` snapshot; headline metrics use multinomial 1X2 (not three Bernoullis).
+ * Uses latest `updatedAt` snapshot. Headline Brier uses 1X2 binary markets + O/U + BTTS.
  */
 export async function runCalibrationForFinishedFixtures(): Promise<void> {
   const done = await prisma.fixture.findMany({
@@ -102,15 +97,6 @@ export async function runCalibrationForFinishedFixtures(): Promise<void> {
     const homeWin = hs > as;
     const awayWin = as > hs;
     const draw = hs === as;
-    const ox = outcome1x2FromScore(hs, as);
-
-    const p1x2 = {
-      home: pred.probHomeWin,
-      draw: pred.probDraw,
-      away: pred.probAwayWin,
-    };
-    const pActual =
-      ox === "home" ? p1x2.home : ox === "draw" ? p1x2.draw : p1x2.away;
 
     const markets: Array<{
       m: string;
@@ -119,13 +105,6 @@ export async function runCalibrationForFinishedFixtures(): Promise<void> {
       brier: number;
       logLoss: number;
     }> = [
-      {
-        m: "1x2_multinomial",
-        p: pActual,
-        hit: true,
-        brier: brierScore1x2Multinomial(p1x2, ox),
-        logLoss: logLoss1x2Multinomial(p1x2, ox),
-      },
       {
         m: "1x2_home",
         p: pred.probHomeWin,
@@ -207,7 +186,7 @@ export async function runCalibrationForFinishedFixtures(): Promise<void> {
   }
 }
 
-/** Mean Brier over headline markets only (multinomial 1X2 + O/U + BTTS). */
+/** Mean Brier over headline markets only (1X2 binary outcomes + O/U + BTTS). */
 export function meanHeadlineBrier(
   audits: Array<{ market: string; brierContribution: number }>,
 ): number | null {

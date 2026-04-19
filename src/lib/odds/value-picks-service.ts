@@ -5,13 +5,14 @@ import { checkValue } from "./value";
 /**
  * Recompute value picks for upcoming fixtures using latest model + current odds snapshots.
  */
-export async function recomputeValuePicksForUpcoming(days = 7): Promise<number> {
+export async function recomputeValuePicksForUpcoming(days = 2): Promise<number> {
   const now = new Date();
   const end = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
 
   const fixtures = await prisma.fixture.findMany({
     where: {
-      status: { in: ["SCHEDULED", "TIMED"] },
+      // Keep in sync with `refreshOddsForUpcomingFixtures` window & statuses
+      status: { in: ["SCHEDULED", "TIMED", "POSTPONED"] },
       utcDate: { gte: now, lte: end },
     },
   });
@@ -123,6 +124,7 @@ export async function recomputeValuePicksForUpcoming(days = 7): Promise<number> 
         kellyFraction: draft.kellyFraction,
         quarterKelly: draft.quarterKelly,
         halfKelly: draft.halfKelly,
+        stakeUnits: draft.stakeUnits,
         rating: draft.rating,
         ratingLabel: draft.ratingLabel,
       };

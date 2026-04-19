@@ -11,6 +11,8 @@
     "db:push": "npx prisma db push",
     "db:seed": "npx tsx src/lib/seed.ts",
     "ingest": "npx tsx src/lib/ingest.ts",
+    "daily": "npx tsx src/scripts/daily.ts",
+    "api-football:ping": "npx tsx src/scripts/ping-api-football.ts",
     "ingest:understat": "npx tsx src/lib/scrapers/understat-ingest.ts",
     "betting:settle": "npx tsx src/scripts/settle-betting.ts",
     "calibration:run": "npx tsx src/scripts/run-calibration.ts"

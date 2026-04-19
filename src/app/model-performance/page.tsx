@@ -1,6 +1,11 @@
 import Link from "next/link";
 import { prisma } from "@/lib/db";
 import { meanHeadlineBrier } from "@/lib/calibration";
+import {
+  formatPickProfitLossDisplay,
+  formatPickStakeDisplay,
+  pickProfitLossNumericForUi,
+} from "@/lib/odds/stake-units";
 
 export const dynamic = "force-dynamic";
 
@@ -75,6 +80,7 @@ export default async function ModelPerformancePage() {
                 <th className="px-3 py-2">Period</th>
                 <th className="px-3 py-2">Market</th>
                 <th className="px-3 py-2">ROI</th>
+                <th className="px-3 py-2">Total P/L</th>
                 <th className="px-3 py-2">Avg CLV</th>
                 <th className="px-3 py-2">Picks</th>
               </tr>
@@ -82,7 +88,7 @@ export default async function ModelPerformancePage() {
             <tbody>
               {perf.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="px-3 py-6 text-center text-text-secondary">
+                  <td colSpan={6} className="px-3 py-6 text-center text-text-secondary">
                     No aggregates yet.
                   </td>
                 </tr>
@@ -94,6 +100,14 @@ export default async function ModelPerformancePage() {
                       {p.market} / {p.league}
                     </td>
                     <td className="px-3 py-2 font-mono">{p.roi.toFixed(2)}%</td>
+                    <td
+                      className={`px-3 py-2 font-mono ${
+                        p.profitLoss >= 0 ? "text-emerald-400" : "text-red-400"
+                      }`}
+                    >
+                      {p.profitLoss >= 0 ? "+" : ""}
+                      {p.profitLoss.toFixed(2)}u
+                    </td>
                     <td className="px-3 py-2 font-mono">
                       {(p.avgClosingLineValue * 100).toFixed(2)}%
                     </td>
@@ -109,8 +123,10 @@ export default async function ModelPerformancePage() {
       <section>
         <h2 className="mb-3 text-sm font-medium text-text-primary">Settled value picks</h2>
         <p className="mb-3 text-xs text-text-secondary">
-          Each row is one flagged bet (stake = quarter Kelly). P/L is in the same units as stake
-          (e.g. if stake is 2.5% bankroll, profit is a fraction of bankroll).
+          <strong>Stake</strong> and <strong>P/L</strong> use the same unit system (1u = your standard
+          bet). P/L is from stake × result at the pick&apos;s decimal odds (win: U·(O−1), loss: −U). A
+          trailing <strong>*</strong> on stake only means legacy quarter-Kelly was stored as 0. Run{" "}
+          <code className="rounded bg-bg-card px-1">npm run betting:settle</code> to refresh aggregates.
         </p>
         <div className="overflow-x-auto rounded-xl border border-border">
           <table className="w-full min-w-[960px] text-left text-sm">
@@ -123,7 +139,7 @@ export default async function ModelPerformancePage() {
                 <th className="px-3 py-2">Model</th>
                 <th className="px-3 py-2">Odds</th>
                 <th className="px-3 py-2">Edge</th>
-                <th className="px-3 py-2">Stake (¼K)</th>
+                <th className="px-3 py-2">Stake</th>
                 <th className="px-3 py-2">P/L</th>
                 <th className="px-3 py-2">Settled</th>
               </tr>
@@ -173,16 +189,38 @@ export default async function ModelPerformancePage() {
                       <td className="px-3 py-2 font-mono">{p.bestOdds.toFixed(2)}</td>
                       <td className="px-3 py-2 font-mono">+{p.edgePct.toFixed(1)}%</td>
                       <td className="px-3 py-2 font-mono">
-                        {(p.quarterKelly * 100).toFixed(2)}%
+                        {formatPickStakeDisplay({
+                          stakeUnits: p.stakeUnits,
+                          quarterKelly: p.quarterKelly,
+                          rating: p.rating,
+                          modelProb: p.modelProb,
+                          bestOdds: p.bestOdds,
+                        })}
                       </td>
                       <td
                         className={`px-3 py-2 font-mono ${
-                          (p.profitLoss ?? 0) >= 0 ? "text-emerald-400" : "text-red-400"
+                          pickProfitLossNumericForUi({
+                            stakeUnits: p.stakeUnits,
+                            profitLoss: p.profitLoss,
+                            quarterKelly: p.quarterKelly,
+                            rating: p.rating,
+                            modelProb: p.modelProb,
+                            bestOdds: p.bestOdds,
+                            outcome: p.outcome,
+                          }) >= 0
+                            ? "text-emerald-400"
+                            : "text-red-400"
                         }`}
                       >
-                        {p.profitLoss != null
-                          ? `${(p.profitLoss * 100).toFixed(2)}%`
-                          : "—"}
+                        {formatPickProfitLossDisplay({
+                          stakeUnits: p.stakeUnits,
+                          profitLoss: p.profitLoss,
+                          quarterKelly: p.quarterKelly,
+                          rating: p.rating,
+                          modelProb: p.modelProb,
+                          bestOdds: p.bestOdds,
+                          outcome: p.outcome,
+                        })}
                       </td>
                       <td className="px-3 py-2 text-xs text-text-secondary">
                         {p.settledAt

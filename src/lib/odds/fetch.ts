@@ -288,7 +288,7 @@ async function processTotalsBookmaker(fixtureId: number, bookmaker: OddsBookmake
 /**
  * Fetch odds from The Odds API for upcoming fixtures (next `days` days) in DB.
  */
-export async function refreshOddsForUpcomingFixtures(days = 7): Promise<FetchOddsResult[]> {
+export async function refreshOddsForUpcomingFixtures(days = 2): Promise<FetchOddsResult[]> {
   const now = new Date();
   const end = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
 

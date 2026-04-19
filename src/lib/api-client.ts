@@ -1,3 +1,13 @@
+/**
+ * HTTP clients for external football APIs.
+ *
+ * **Used by ingest / `npm run daily`:** `fetchFootballData` → **api.football-data.org**
+ * (`FOOTBALL_DATA_API_KEY`). That is the only provider wired into `src/lib/ingest.ts`.
+ *
+ * **`fetchApiFootball` is not called anywhere** in this repo today — it targets
+ * **RapidAPI / api-sports.io** (`API_FOOTBALL_KEY`). Your RapidAPI dashboard will show **0
+ * requests** until you add a caller or run `npm run api-football:ping` to test the key.
+ */
 import { FOOTBALL_DATA_BASE, API_FOOTBALL_BASE } from "./constants";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -36,6 +46,7 @@ export async function fetchFootballData<T = unknown>(
 let lastApiFootballCall = 0;
 const AF_MIN_INTERVAL = 1000;
 
+/** RapidAPI API-Football (api-sports.io). Reserved for future features — ingest does not use this. */
 export async function fetchApiFootball<T = unknown>(
   path: string,
   params?: Record<string, string>,

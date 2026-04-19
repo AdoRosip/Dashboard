@@ -11,7 +11,9 @@ async function seed() {
     { id: "BL1", code: "BL1", name: "Bundesliga", country: "Germany", isEuropean: false },
     { id: "SA", code: "SA", name: "Serie A", country: "Italy", isEuropean: false },
     { id: "FL1", code: "FL1", name: "Ligue 1", country: "France", isEuropean: false },
-    { id: "CL", code: "CL", name: "Champions League", country: "Europe", isEuropean: true },
+    { id: "CL", code: "CL", name: "UEFA Champions League", country: "Europe", isEuropean: true },
+    { id: "EC", code: "EC", name: "UEFA Europa League", country: "Europe", isEuropean: true },
+    { id: "CLI", code: "CLI", name: "UEFA Conference League", country: "Europe", isEuropean: true },
   ];
 
   for (const c of competitions) {

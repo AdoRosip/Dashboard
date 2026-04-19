@@ -41,7 +41,12 @@ export function computeMotivationScore(ctx: MotivationContext): {
   else if (pos <= 4 && md >= 34) base = 0.9;
   else if (pos >= 16 && md >= 28) base = 0.88;
   else if (pos >= 4 && pos <= 7 && md >= 25) base = 0.75;
-  else if (ctx.competitionId === "CL" || ctx.competitionId === "EC") base = 0.7;
+  else if (
+    ctx.competitionId === "CL" ||
+    ctx.competitionId === "EC" ||
+    ctx.competitionId === "CLI"
+  )
+    base = 0.7;
   else if (pos >= 8 && pos <= 14 && md > 34) base = 0.25;
 
   let motivationScore = base;

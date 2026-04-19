@@ -4,6 +4,8 @@ import {
   COMPETITIONS,
   CURRENT_SEASON,
   COMPETITION_CODES,
+  DEFAULT_UPCOMING_DAYS,
+  MAX_UPCOMING_DAYS,
 } from "./constants";
 import { refreshUnderstat } from "./scrapers/understat-ingest";
 import { refreshV2ForUpcomingFixtures } from "./prediction/pipeline-v2";
@@ -38,7 +40,7 @@ interface FDMatch {
   status: string;
   matchday?: number;
   venue?: string;
-  score: FDScore;
+  score?: FDScore;
 }
 
 interface FDStanding {
@@ -74,9 +76,26 @@ function toISODate(date: Date): string {
   return date.toISOString().split("T")[0];
 }
 
+function clampUpcomingDays(n: number): number {
+  return Math.min(Math.max(1, Math.floor(n)), MAX_UPCOMING_DAYS);
+}
+
 function computeWinner(home: number | null, away: number | null): string | null {
   if (home == null || away == null) return null;
   return home > away ? "HOME" : home < away ? "AWAY" : "DRAW";
+}
+
+/**
+ * When Football-Data returns TIMED + null scores after full-time, we must not wipe
+ * scores we already stored from a FINISHED ingest. Prefer API when it sends a number;
+ * otherwise keep the existing DB value.
+ */
+function mergeScore(
+  api: number | null | undefined,
+  existing: number | null | undefined,
+): number | null {
+  if (api !== null && api !== undefined) return api;
+  return existing ?? null;
 }
 
 async function logRefresh(
@@ -107,6 +126,21 @@ async function ensureCompetitions() {
 }
 
 const EUROPEAN_COMP_IDS = new Set(["CL", "EC", "CLI"]);
+
+/**
+ * football-data.org v4 league codes differ from our internal `competitionId` strings
+ * (kept for Odds API + DB). Without this, EL/UCL matches were dropped in `upsertMatch`.
+ * - UEFA Europa League → API **EL** → we store **EC**
+ * - UEFA Conference League → API **UCL** → we store **CLI** (Champions League stays **CL**)
+ */
+const FOOTBALL_DATA_CODE_TO_INTERNAL: Record<string, string> = {
+  EL: "EC",
+  UCL: "CLI",
+};
+
+function normalizeFootballDataCompetitionCode(apiCode: string): string {
+  return FOOTBALL_DATA_CODE_TO_INTERNAL[apiCode] ?? apiCode;
+}
 
 async function upsertTeam(team: FDTeam, competitionId: string) {
   const isEuropean = EUROPEAN_COMP_IDS.has(competitionId);
@@ -150,15 +184,32 @@ async function upsertTeam(team: FDTeam, competitionId: string) {
 }
 
 async function upsertMatch(match: FDMatch) {
-  const compCode = match.competition.code;
+  const compCode = normalizeFootballDataCompetitionCode(match.competition.code);
   const validCodes = COMPETITION_CODES as readonly string[];
   if (!validCodes.includes(compCode)) return;
 
   await upsertTeam(match.homeTeam, compCode);
   await upsertTeam(match.awayTeam, compCode);
 
-  const homeScore = match.score?.fullTime?.home ?? null;
-  const awayScore = match.score?.fullTime?.away ?? null;
+  const apiHomeFt = match.score?.fullTime?.home;
+  const apiAwayFt = match.score?.fullTime?.away;
+  const apiHomeHt = match.score?.halfTime?.home;
+  const apiAwayHt = match.score?.halfTime?.away;
+
+  const existing = await prisma.fixture.findUnique({
+    where: { id: match.id },
+    select: {
+      scoreHomeFt: true,
+      scoreAwayFt: true,
+      scoreHomeHt: true,
+      scoreAwayHt: true,
+    },
+  });
+
+  const scoreHomeFt = mergeScore(apiHomeFt, existing?.scoreHomeFt);
+  const scoreAwayFt = mergeScore(apiAwayFt, existing?.scoreAwayFt);
+  const scoreHomeHt = mergeScore(apiHomeHt, existing?.scoreHomeHt);
+  const scoreAwayHt = mergeScore(apiAwayHt, existing?.scoreAwayHt);
 
   await prisma.fixture.upsert({
     where: { id: match.id },
@@ -166,11 +217,11 @@ async function upsertMatch(match: FDMatch) {
       utcDate: new Date(match.utcDate),
       status: match.status,
       matchday: match.matchday ?? null,
-      scoreHomeFt: homeScore,
-      scoreAwayFt: awayScore,
-      scoreHomeHt: match.score?.halfTime?.home ?? null,
-      scoreAwayHt: match.score?.halfTime?.away ?? null,
-      winner: computeWinner(homeScore, awayScore),
+      scoreHomeFt,
+      scoreAwayFt,
+      scoreHomeHt,
+      scoreAwayHt,
+      winner: computeWinner(scoreHomeFt, scoreAwayFt),
     },
     create: {
       id: match.id,
@@ -181,11 +232,11 @@ async function upsertMatch(match: FDMatch) {
       status: match.status,
       matchday: match.matchday ?? null,
       venue: match.venue ?? null,
-      scoreHomeFt: homeScore,
-      scoreAwayFt: awayScore,
-      scoreHomeHt: match.score?.halfTime?.home ?? null,
-      scoreAwayHt: match.score?.halfTime?.away ?? null,
-      winner: computeWinner(homeScore, awayScore),
+      scoreHomeFt,
+      scoreAwayFt,
+      scoreHomeHt,
+      scoreAwayHt,
+      winner: computeWinner(scoreHomeFt, scoreAwayFt),
     },
   });
 }
@@ -222,7 +273,8 @@ export async function ingestFixtures(aheadDays = 2) {
 }
 
 // ─── RECENT RESULTS — LAST N DAYS ───────────────────────────────
-// Single API call to get recently finished matches for form + H2H.
+// Date-range only (no status=FINISHED): Football-Data can expose fullTime scores while
+// status is still TIMED; FINISHED-only would miss them until the status flips.
 
 export async function ingestRecentResults(daysBack = 7) {
   console.log(`Ingesting recent results (last ${daysBack} days)...`);
@@ -233,7 +285,7 @@ export async function ingestRecentResults(daysBack = 7) {
 
   try {
     const data = await fetchFootballData<{ matches: FDMatch[] }>(
-      `/matches?dateFrom=${dateFrom}&dateTo=${dateTo}&status=FINISHED`,
+      `/matches?dateFrom=${dateFrom}&dateTo=${dateTo}`,
     );
 
     let count = 0;
@@ -540,7 +592,12 @@ export async function refreshAll(options?: {
   resultsDaysBack?: number;
   skipUnderstat?: boolean;
 }) {
-  const { aheadDays = 2, resultsDaysBack = 7, skipUnderstat = false } = options ?? {};
+  const {
+    aheadDays: rawAhead = DEFAULT_UPCOMING_DAYS,
+    resultsDaysBack = 7,
+    skipUnderstat = false,
+  } = options ?? {};
+  const aheadDays = clampUpcomingDays(rawAhead);
 
   console.log("=== Starting data refresh ===");
   console.log(`  Window: upcoming ${aheadDays}d, results ${resultsDaysBack}d back`);
@@ -561,7 +618,7 @@ export async function refreshAll(options?: {
 
   try {
     console.log("V2 modifiers (congestion, motivation, availability)...");
-    await refreshV2ForUpcomingFixtures(Math.max(aheadDays, 7));
+    await refreshV2ForUpcomingFixtures(aheadDays);
   } catch (e) {
     console.warn("V2 pipeline:", e);
   }
@@ -569,8 +626,8 @@ export async function refreshAll(options?: {
   if (process.env.ODDS_API_KEY) {
     try {
       console.log("Odds API + value picks...");
-      await refreshOddsForUpcomingFixtures(7);
-      await recomputeValuePicksForUpcoming(7);
+      await refreshOddsForUpcomingFixtures(aheadDays);
+      await recomputeValuePicksForUpcoming(aheadDays);
     } catch (e) {
       console.warn("Odds/value:", e);
     }
@@ -591,7 +648,9 @@ export async function refreshAll(options?: {
 // ─── CLI ENTRY POINT ─────────────────────────────────────────────
 
 if (require.main === module) {
-  const aheadDays = parseInt(process.env.AHEAD_DAYS || "2");
+  const aheadDays = clampUpcomingDays(
+    parseInt(process.env.AHEAD_DAYS || String(DEFAULT_UPCOMING_DAYS), 10),
+  );
   const resultsDaysBack = parseInt(process.env.RESULTS_DAYS || "7");
   const skipUnderstat = process.env.SKIP_UNDERSTAT === "true";
 

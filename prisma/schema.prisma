@@ -597,6 +597,9 @@ model ValuePick {
   quarterKelly    Float
   halfKelly       Float
 
+  /** Discrete stake size for settlement & ROI; null on legacy rows → use quarterKelly. */
+  stakeUnits      Float?
+
   rating          Int      @default(1)
   ratingLabel     String   @default("speculative")
 

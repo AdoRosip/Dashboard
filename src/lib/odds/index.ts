@@ -3,6 +3,16 @@ export { checkValue, type ValueCheckInput, type ValuePickDraft } from "./value";
 export { refreshOddsForUpcomingFixtures, teamsMatchOddsEvent } from "./fetch";
 export { recomputeValuePicksForUpcoming } from "./value-picks-service";
 export {
+  canonicalProfitLossUnits,
+  canonicalStakeUnits,
+  computeStakeUnits,
+  expectedValuePerUnitStake,
+  formatPickProfitLossDisplay,
+  formatPickStakeDisplay,
+  formatStakeUnits,
+  pickProfitLossNumericForUi,
+} from "./stake-units";
+export {
   FIXTURE_STATUS_FINAL,
   FIXTURE_STATUS_LIVE,
   FIXTURE_STATUS_PRE_OR_LIVE,

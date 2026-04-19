@@ -47,7 +47,7 @@ function nextEuropeanMatchImportance(
   return "knockout_european";
 }
 
-export async function refreshV2ForUpcomingFixtures(aheadDays = 7) {
+export async function refreshV2ForUpcomingFixtures(aheadDays = 2) {
   const now = new Date();
   const end = new Date(now.getTime() + aheadDays * 24 * 60 * 60 * 1000);
 

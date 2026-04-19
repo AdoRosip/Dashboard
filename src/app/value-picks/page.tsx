@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { prisma } from "@/lib/db";
 import { FIXTURE_STATUS_LIVE } from "@/lib/odds/fixture-pick-status";
+import { formatPickStakeDisplay } from "@/lib/odds/stake-units";
 
 export const dynamic = "force-dynamic";
 
@@ -12,7 +13,7 @@ const pickInclude = {
 
 export default async function ValuePicksPage() {
   const now = new Date();
-  const [activePicks, pendingPicks, perf] = await Promise.all([
+  const [activePicks, pendingPicks, perf, settledWithClvCount] = await Promise.all([
     prisma.valuePick.findMany({
       where: {
         settled: false,
@@ -42,6 +43,9 @@ export default async function ValuePicksPage() {
     prisma.bettingPerformance.findFirst({
       where: { period: "all_time", market: "all", league: "all" },
     }),
+    prisma.valuePick.count({
+      where: { settled: true, closingLineValue: { not: null } },
+    }),
   ]);
 
   return (
@@ -57,22 +61,47 @@ export default async function ValuePicksPage() {
           (status can stay SCHEDULED until ingest updates). Past kickoff unsettled picks go to{" "}
           <strong>Pending settlement</strong> until{" "}
           <code className="rounded bg-bg-card px-1">npm run betting:settle</code> (also runs after a
-          full ingest).
+          full ingest).{" "}
+          <strong>Stake</strong> is in <strong>units</strong> (1u = your standard bet size); sizing
+          follows rating + expected value (see <code className="rounded bg-bg-card px-1">stake-units.ts</code>
+          ). A <strong>*</strong> on stake means legacy quarter-Kelly was stored as 0 (stake still comes from the unit model).
         </p>
       </div>
 
       {perf && (
         <section className="rounded-xl border border-border bg-bg-secondary p-4">
           <h2 className="text-sm font-medium text-text-primary">All-time performance</h2>
-          <dl className="mt-3 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+          <dl className="mt-3 grid grid-cols-2 gap-3 text-sm sm:grid-cols-3 lg:grid-cols-5">
             <div>
               <dt className="text-text-secondary">ROI</dt>
               <dd className="font-mono text-text-primary">{perf.roi.toFixed(2)}%</dd>
             </div>
             <div>
+              <dt className="text-text-secondary">Total P/L</dt>
+              <dd
+                className={`font-mono ${
+                  perf.profitLoss >= 0 ? "text-emerald-400" : "text-red-400"
+                }`}
+              >
+                {perf.profitLoss >= 0 ? "+" : ""}
+                {perf.profitLoss.toFixed(2)}u
+              </dd>
+            </div>
+            <div>
               <dt className="text-text-secondary">Avg CLV</dt>
               <dd className="font-mono text-text-primary">
-                {(perf.avgClosingLineValue * 100).toFixed(2)}%
+                {settledWithClvCount === 0 ? (
+                  <span title="Closing-line value: edge vs price at kickoff close. Needs a closing (or latest) odds snapshot when settling.">
+                    —
+                  </span>
+                ) : (
+                  `${(perf.avgClosingLineValue * 100).toFixed(2)}%`
+                )}
+              </dd>
+              <dd className="mt-0.5 text-[11px] leading-snug text-text-secondary">
+                {settledWithClvCount === 0
+                  ? "No closing odds on settled picks yet (shows 0% until snapshots exist)."
+                  : `Mean vs closing line, ${settledWithClvCount} pick${settledWithClvCount === 1 ? "" : "s"} with data.`}
               </dd>
             </div>
             <div>
@@ -91,7 +120,7 @@ export default async function ValuePicksPage() {
         title="Active picks"
         subtitle="Match not started or still in play (fixture status: scheduled, timed, or live)."
         picks={activePicks}
-        emptyMessage="No active value picks — run odds refresh after fixtures are ingested."
+        emptyMessage="No active picks — ensure ODDS_API_KEY, ingest + odds refresh (e.g. npm run daily), fixtures in the next 48h, and model edge vs book (≥3%) per checkValue."
       />
 
       <PicksTable
@@ -141,7 +170,7 @@ function PicksTable({
               <th className="px-3 py-2">Odds</th>
               <th className="px-3 py-2">Book</th>
               <th className="px-3 py-2">Edge</th>
-              <th className="px-3 py-2">Kelly (¼)</th>
+              <th className="px-3 py-2">Stake</th>
               <th className="px-3 py-2">Rating</th>
             </tr>
           </thead>
@@ -185,7 +214,15 @@ function PicksTable({
                   <td className="px-3 py-2 font-mono text-emerald-400">
                     +{p.edgePct.toFixed(1)}%
                   </td>
-                  <td className="px-3 py-2 font-mono">{(p.quarterKelly * 100).toFixed(2)}%</td>
+                  <td className="px-3 py-2 font-mono">
+                    {formatPickStakeDisplay({
+                      stakeUnits: p.stakeUnits,
+                      quarterKelly: p.quarterKelly,
+                      rating: p.rating,
+                      modelProb: p.modelProb,
+                      bestOdds: p.bestOdds,
+                    })}
+                  </td>
                   <td className="px-3 py-2">
                     <span className="rounded bg-bg-card px-2 py-0.5 text-xs">
                       {p.rating}★ {p.ratingLabel}
