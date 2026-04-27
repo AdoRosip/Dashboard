@@ -80,6 +80,21 @@ function clampUpcomingDays(n: number): number {
   return Math.min(Math.max(1, Math.floor(n)), MAX_UPCOMING_DAYS);
 }
 
+function seasonBounds(season: string): { start: Date; end: Date } {
+  const startYear = parseInt(season, 10);
+  if (Number.isNaN(startYear)) {
+    const now = new Date();
+    return {
+      start: new Date(Date.UTC(now.getUTCFullYear(), 6, 1)),
+      end: new Date(Date.UTC(now.getUTCFullYear() + 1, 5, 30, 23, 59, 59, 999)),
+    };
+  }
+  return {
+    start: new Date(Date.UTC(startYear, 6, 1)),
+    end: new Date(Date.UTC(startYear + 1, 5, 30, 23, 59, 59, 999)),
+  };
+}
+
 function computeWinner(home: number | null, away: number | null): string | null {
   if (home == null || away == null) return null;
   return home > away ? "HOME" : home < away ? "AWAY" : "DRAW";
@@ -129,13 +144,11 @@ const EUROPEAN_COMP_IDS = new Set(["CL", "EC", "CLI"]);
 
 /**
  * football-data.org v4 league codes differ from our internal `competitionId` strings
- * (kept for Odds API + DB). Without this, EL/UCL matches were dropped in `upsertMatch`.
+ * (kept for Odds API + DB). Without this, EL matches were dropped in `upsertMatch`.
  * - UEFA Europa League → API **EL** → we store **EC**
- * - UEFA Conference League → API **UCL** → we store **CLI** (Champions League stays **CL**)
  */
 const FOOTBALL_DATA_CODE_TO_INTERNAL: Record<string, string> = {
   EL: "EC",
-  UCL: "CLI",
 };
 
 function normalizeFootballDataCompetitionCode(apiCode: string): string {
@@ -441,28 +454,39 @@ export async function ingestTopScorers() {
 
 export async function computeDerivedStats() {
   console.log("Computing derived stats...");
+  const { start: seasonStart, end: seasonEnd } = seasonBounds(CURRENT_SEASON);
 
-  const teams = await prisma.team.findMany({
-    include: {
-      homeFixtures: {
-        where: { status: "FINISHED" },
-        orderBy: { utcDate: "desc" },
-        take: 50,
-      },
-      awayFixtures: {
-        where: { status: "FINISHED" },
-        orderBy: { utcDate: "desc" },
-        take: 50,
-      },
-    },
-  });
+  const teams = await prisma.team.findMany();
 
   for (const team of teams) {
+    if (!team.competitionId) continue;
+
+    const [homeFixtures, awayFixtures] = await Promise.all([
+      prisma.fixture.findMany({
+        where: {
+          status: "FINISHED",
+          competitionId: team.competitionId,
+          homeTeamId: team.id,
+          utcDate: { gte: seasonStart, lte: seasonEnd },
+        },
+        orderBy: { utcDate: "desc" },
+      }),
+      prisma.fixture.findMany({
+        where: {
+          status: "FINISHED",
+          competitionId: team.competitionId,
+          awayTeamId: team.id,
+          utcDate: { gte: seasonStart, lte: seasonEnd },
+        },
+        orderBy: { utcDate: "desc" },
+      }),
+    ]);
+
     let goalsHome = 0, concededHome = 0, goalsAway = 0, concededAway = 0;
     let cleanSheets = 0, btts = 0, over25 = 0;
     let matchesHome = 0, matchesAway = 0;
 
-    for (const m of team.homeFixtures) {
+    for (const m of homeFixtures) {
       if (m.scoreHomeFt != null && m.scoreAwayFt != null) {
         goalsHome += m.scoreHomeFt;
         concededHome += m.scoreAwayFt;
@@ -473,7 +497,7 @@ export async function computeDerivedStats() {
       }
     }
 
-    for (const m of team.awayFixtures) {
+    for (const m of awayFixtures) {
       if (m.scoreHomeFt != null && m.scoreAwayFt != null) {
         goalsAway += m.scoreAwayFt;
         concededAway += m.scoreHomeFt;
@@ -484,20 +508,18 @@ export async function computeDerivedStats() {
       }
     }
 
-    if (team.competitionId) {
-      await prisma.teamSeasonStats.updateMany({
-        where: {
-          teamId: team.id,
-          competitionId: team.competitionId,
-          season: CURRENT_SEASON,
-        },
-        data: {
-          goalsHome, goalsAway, concededHome, concededAway,
-          cleanSheets, bttsCount: btts, over25Count: over25,
-          matchesPlayedHome: matchesHome, matchesPlayedAway: matchesAway,
-        },
-      });
-    }
+    await prisma.teamSeasonStats.updateMany({
+      where: {
+        teamId: team.id,
+        competitionId: team.competitionId,
+        season: CURRENT_SEASON,
+      },
+      data: {
+        goalsHome, goalsAway, concededHome, concededAway,
+        cleanSheets, bttsCount: btts, over25Count: over25,
+        matchesPlayedHome: matchesHome, matchesPlayedAway: matchesAway,
+      },
+    });
   }
 
   // Mark key players (top 3 goal contributors per team) — atomic batch

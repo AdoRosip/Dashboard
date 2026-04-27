@@ -107,6 +107,71 @@ export function weightedAvg(values: number[], halfLife: number = 5): number {
   return values.reduce((sum, v, i) => sum + v * weights[i], 0);
 }
 
+export interface WeightedRateInput {
+  recentOverall?: number | null;
+  recentVenue?: number | null;
+  season?: number | null;
+  leaguePrior: number;
+  weights: {
+    recentOverall: number;
+    recentVenue: number;
+    season: number;
+    leaguePrior: number;
+  };
+}
+
+export interface WeightedRateResult {
+  value: number;
+  weights: {
+    recentOverall: number;
+    recentVenue: number;
+    season: number;
+    leaguePrior: number;
+  };
+}
+
+function usableRate(value: number | null | undefined): value is number {
+  return value != null && Number.isFinite(value) && value > 0;
+}
+
+export function combineWeightedRate(input: WeightedRateInput): WeightedRateResult {
+  const rows = [
+    ["recentOverall", input.recentOverall, input.weights.recentOverall],
+    ["recentVenue", input.recentVenue, input.weights.recentVenue],
+    ["season", input.season, input.weights.season],
+    ["leaguePrior", input.leaguePrior, input.weights.leaguePrior],
+  ] as const;
+
+  const available = rows.filter(([, value, weight]) => usableRate(value) && weight > 0);
+  const totalWeight = available.reduce((sum, [, , weight]) => sum + weight, 0);
+  if (available.length === 0 || totalWeight <= 0) {
+    return {
+      value: input.leaguePrior,
+      weights: { recentOverall: 0, recentVenue: 0, season: 0, leaguePrior: 1 },
+    };
+  }
+
+  const normalized = {
+    recentOverall: 0,
+    recentVenue: 0,
+    season: 0,
+    leaguePrior: 0,
+  };
+  let value = 0;
+  for (const [key, rate, weight] of available) {
+    const w = weight / totalWeight;
+    normalized[key] = w;
+    value += Number(rate) * w;
+  }
+
+  return { value, weights: normalized };
+}
+
+export function boundedMultiplier(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return 1;
+  return Math.max(min, Math.min(max, value));
+}
+
 function linearSlope(values: number[]): number {
   if (values.length < 2) return 0;
   const n = values.length;
@@ -223,10 +288,41 @@ export function computeFormFeatures(
   };
 }
 
+/** One H2H row from DB: canonical lower `teamAId` + per-team scores; optional venue home side. */
+export type H2hMatchScoreRow = {
+  teamAId: number;
+  teamBId: number;
+  scoreA: number;
+  scoreB: number;
+  homeTeamId?: number | null;
+};
+
+/**
+ * Goals scored by `teamId` in a past meeting. Uses `homeTeamId` + scores so we respect the
+ * historical venue orientation; falls back to canonical (teamA/scoreA) when `homeTeamId` is null.
+ */
+export function goalsScoredByTeamInH2hRow(m: H2hMatchScoreRow, teamId: number): number {
+  if (m.homeTeamId != null) {
+    const homeGoals = m.homeTeamId === m.teamAId ? m.scoreA : m.scoreB;
+    const awayGoals = m.homeTeamId === m.teamAId ? m.scoreB : m.scoreA;
+    return teamId === m.homeTeamId ? homeGoals : awayGoals;
+  }
+  return m.teamAId === teamId ? m.scoreA : m.scoreB;
+}
+
 export function computeH2HFeatures(
-  h2hMatches: Array<{ scoreA: number; scoreB: number; xgA?: number | null; xgB?: number | null }>,
-  teamAId: number,
-  homeTeamId: number,
+  h2hMatches: Array<{
+    teamAId: number;
+    teamBId: number;
+    scoreA: number;
+    scoreB: number;
+    homeTeamId?: number | null;
+    xgA?: number | null;
+    xgB?: number | null;
+  }>,
+  /** `Fixture.homeTeamId` / `awayTeamId` for the match being predicted (not canonical teamA order). */
+  fixtureHomeTeamId: number,
+  fixtureAwayTeamId: number,
 ): H2HFeatures {
   const n = h2hMatches.length;
   if (n === 0) {
@@ -242,11 +338,19 @@ export function computeH2HFeatures(
     };
   }
 
-  let homeWins = 0, awayWins = 0, draws = 0, totalGoals = 0, btts = 0, over25 = 0;
+  const goalsForTeam = (m: (typeof h2hMatches)[0], teamId: number): number =>
+    goalsScoredByTeamInH2hRow(m, teamId);
+
+  let homeWins = 0,
+    awayWins = 0,
+    draws = 0,
+    totalGoals = 0,
+    btts = 0,
+    over25 = 0;
 
   for (const m of h2hMatches) {
-    const homeScore = teamAId === homeTeamId ? m.scoreA : m.scoreB;
-    const awayScore = teamAId === homeTeamId ? m.scoreB : m.scoreA;
+    const homeScore = goalsForTeam(m, fixtureHomeTeamId);
+    const awayScore = goalsForTeam(m, fixtureAwayTeamId);
     totalGoals += homeScore + awayScore;
     if (homeScore > awayScore) homeWins++;
     else if (homeScore < awayScore) awayWins++;
@@ -258,8 +362,8 @@ export function computeH2HFeatures(
   const last3 = h2hMatches.slice(0, 3);
   let last3HomeWins = 0;
   for (const m of last3) {
-    const hs = teamAId === homeTeamId ? m.scoreA : m.scoreB;
-    const as_ = teamAId === homeTeamId ? m.scoreB : m.scoreA;
+    const hs = goalsForTeam(m, fixtureHomeTeamId);
+    const as_ = goalsForTeam(m, fixtureAwayTeamId);
     if (hs > as_) last3HomeWins++;
   }
 
@@ -319,6 +423,7 @@ export function computeContextFeatures(
   awayStats: TeamSeasonStats | null,
   lastMatchDate: Date | null,
   isAfterEuropean: boolean,
+  referenceDate: Date = new Date(),
 ): ContextFeatures & Partial<TeamFeatures> {
   const homePos = homeStats?.position ?? 10;
   const awayPos = awayStats?.position ?? 10;
@@ -329,7 +434,7 @@ export function computeContextFeatures(
   else if (homePos >= 17 || awayPos >= 17) motivation = "high_negative";
 
   const daysSince = lastMatchDate
-    ? (Date.now() - lastMatchDate.getTime()) / (1000 * 60 * 60 * 24)
+    ? (referenceDate.getTime() - lastMatchDate.getTime()) / (1000 * 60 * 60 * 24)
     : 7;
 
   return {
@@ -445,4 +550,46 @@ export function computeLambda(inputs: LambdaInputs): number {
   lambda *= inputs.regressionModifier;
 
   return Math.max(0.3, Math.min(5.0, lambda));
+}
+
+export interface WeightedLambdaV3Inputs {
+  attackRating: number;
+  opponentDefenseRating: number;
+  isHome: boolean;
+  homeAdvantageGoals: number;
+  leagueAvgXg: number;
+  modifiers: Record<string, number>;
+  minLambda: number;
+  maxLambda: number;
+}
+
+export interface WeightedLambdaV3Result {
+  lambda: number;
+  baseLambda: number;
+  combinedModifier: number;
+  homeAdvantageAdjustment: number;
+}
+
+export function computeWeightedLambdaV3(
+  inputs: WeightedLambdaV3Inputs,
+): WeightedLambdaV3Result {
+  const leagueAvg = Math.max(inputs.leagueAvgXg, 0.01);
+  const attackStrength = Math.max(inputs.attackRating, 0.01) / leagueAvg;
+  const defenseWeakness = Math.max(inputs.opponentDefenseRating, 0.01) / leagueAvg;
+  const baseLambda = leagueAvg * attackStrength * defenseWeakness;
+  const combinedModifier = Object.values(inputs.modifiers).reduce(
+    (product, modifier) => product * (Number.isFinite(modifier) ? modifier : 1),
+    1,
+  );
+  const homeAdvantageAdjustment = inputs.isHome
+    ? inputs.homeAdvantageGoals / 2
+    : -inputs.homeAdvantageGoals / 2;
+  const lambda = baseLambda * combinedModifier + homeAdvantageAdjustment;
+
+  return {
+    lambda: Math.max(inputs.minLambda, Math.min(inputs.maxLambda, lambda)),
+    baseLambda,
+    combinedModifier,
+    homeAdvantageAdjustment,
+  };
 }

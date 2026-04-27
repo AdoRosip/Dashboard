@@ -7,7 +7,7 @@ export const COMPETITION_TO_ODDS_SPORT_KEY: Record<string, string> = {
   FL1: "soccer_france_ligue_one",
   CL: "soccer_uefa_champs_league",
   EC: "soccer_uefa_europa_league",
-  CLI: "soccer_uefa_europa_conference_league",
+  CLI: "soccer_conmebol_copa_libertadores",
 };
 
 export function oddsSportKeyForCompetition(competitionId: string): string | null {

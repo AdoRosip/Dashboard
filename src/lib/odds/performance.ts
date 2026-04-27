@@ -4,13 +4,24 @@ import {
   resolveStakeForSettlement,
 } from "./stake-units";
 
+type SettledBetDecision = {
+  outcome: string | null;
+  stakeUnits: number | null;
+  rating: number | null;
+  modelProb: number;
+  bestOdds: number;
+  profitLoss: number | null;
+  closingLineValue: number | null;
+  closingLineSnapshotKind?: string | null;
+};
+
 /**
- * Recompute aggregate betting performance from settled ValuePicks.
+ * Recompute aggregate betting performance from immutable BetDecisions.
  */
 export async function recomputeBettingPerformance(): Promise<void> {
-  const settled = await prisma.valuePick.findMany({
+  const settled = await prisma.betDecision.findMany({
     where: { settled: true, profitLoss: { not: null } },
-  });
+  }) as SettledBetDecision[];
 
   let totalStaked = 0;
   let totalReturn = 0;
@@ -27,24 +38,27 @@ export async function recomputeBettingPerformance(): Promise<void> {
     }
     const stake = resolveStakeForSettlement({
       stakeUnits: p.stakeUnits,
-      rating: p.rating,
+      rating: p.rating ?? 1,
       modelProb: p.modelProb,
       bestOdds: p.bestOdds,
     });
     const pl = resolveProfitLossForAggregate({
       stakeUnits: p.stakeUnits,
-      quarterKelly: p.quarterKelly,
+      quarterKelly: 0,
       profitLoss: p.profitLoss,
       outcome: p.outcome,
       bestOdds: p.bestOdds,
-      rating: p.rating,
+      rating: p.rating ?? 1,
       modelProb: p.modelProb,
     });
     totalStaked += stake;
     totalReturn += stake + pl;
     if (p.outcome === "win") wins++;
     else if (p.outcome === "loss") losses++;
-    if (p.closingLineValue != null) {
+    if (
+      p.closingLineValue != null &&
+      p.closingLineSnapshotKind === "closing"
+    ) {
       clvSum += p.closingLineValue;
       clvN++;
     }
@@ -73,6 +87,7 @@ export async function recomputeBettingPerformance(): Promise<void> {
       roi,
       avgClosingLineValue: avgClv,
       hitRate,
+      updatedAt: new Date(),
     },
     update: {
       totalPicks: settled.length,
@@ -85,6 +100,7 @@ export async function recomputeBettingPerformance(): Promise<void> {
       roi,
       avgClosingLineValue: avgClv,
       hitRate,
+      updatedAt: new Date(),
     },
   });
 }

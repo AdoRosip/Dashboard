@@ -153,7 +153,7 @@ implemented as `**(modelProb * bestOdds - 1) / (bestOdds - 1)`**, then **clamped
 
 ### 4.3 Which picks get stored (`value-picks-service.ts`)
 
-For each **scheduled/timed** fixture in the next **N** days (default 7):
+For each **SCHEDULED** or **TIMED** fixture in the next **N** days (postponed/cancelled are excluded so picks are not re-flagged while unresolved):
 
 - Candidates: **1x2_home**, **1x2_draw**, **1x2_away**, **over25**, **under25** (model prob for under = 1 - P(\text{over 2.5})).
 - For each, finds **best decimal odds** across bookmakers for that outcome (not the same as best “value” across all outcomes — it’s per-outcome line shopping).
@@ -170,12 +170,13 @@ For each **scheduled/timed** fixture in the next **N** days (default 7):
 `**settleValuePicks()`**:
 
 - Loads all `**ValuePick`** with `**settled: false`**.
-- Skips until `**Fixture.status === FINISHED`** and full-time scores exist.
+- **`CANCELLED`** / **`POSTPONED`** fixtures → **`outcome: void`**, `profitLoss: 0`, settled.
+- Otherwise waits until **`scoreHomeFt`** / **`scoreAwayFt`** exist (does not require `status === FINISHED` if scores are present after ingest lag).
 - Resolves **win/loss** from `**market`** and score:
   - 1X2 vs result; **Over 2.5** if total goals **> 2**; **Under 2.5** if **< 3** (exactly 2 goals counts as under); **BTTS** if both teams scored.
-- **Stake:** `quarterKelly` (treated as fraction of bankroll in the same units throughout).
+- **Stake:** `**stakeUnits`** when set, else derived from rating + EV (`**stake-units.ts`**) — same units as P/L.
 - **P/L:** win → `stake * (bestOdds - 1)`; loss → `-stake`.
-- **Closing line / CLV (optional):** tries `**OddsSnapshot`** with `snapshotType: "closing"` for that bookmaker/market; falls back to latest `**current`**. Compares de-vig implied at close vs pick’s opening `**impliedProb`**.
+- **Closing line:** prefers `**OddsSnapshot`** with `snapshotType: "closing"`; if missing, uses latest `**current`** and sets `**closingLineSnapshotKind: "current_fallback"` on the pick (not true CLV). Headline **average CLV** in `**performance.ts`** only averages rows where `closingLineSnapshotKind === "closing"`.
 
 ### 5.2 Aggregates (`performance.ts`)
 
@@ -189,7 +190,8 @@ For each **scheduled/timed** fixture in the next **N** days (default 7):
 
 - Iterates recent **finished** fixtures with scores (up to **2000** per run, newest first).
 - Loads `**Prediction`** for `**MODEL_VERSION`** if present, else latest `**updatedAt`** row for that fixture.
-- For each fixture writes `**PredictionAudit`** rows and updates `**CalibrationBucket`** (incremental counts per probability bin).
+- For each fixture writes `**PredictionAudit`** rows (upsert per `fixtureId` + `market`) and updates `**CalibrationBucket`** when the audit row is **new** — audit + bucket run in one **transaction** so reruns do not double-count buckets and partial writes cannot leave audit without bucket.
+- Bucket **`season`** uses the fixture kickoff **UTC calendar year** (`**calibrationSeasonKeyFromFixture**`), not a global “current season” constant.
 
 **Headline metrics (mean Brier):**
 
@@ -233,15 +235,21 @@ See `**prisma/schema.prisma**` for exact fields and indexes.
 | Refresh odds + rebuild value picks    | `POST /api/odds/refresh`                                 |
 | Settle bets + recompute betting stats | `npm run betting:settle` or `POST /api/betting/settle`   |
 | Run calibration                       | `npm run calibration:run` or `POST /api/calibration/run` |
+| Unit tests (safeguards)               | `npm test`                                               |
 | Prisma client                         | `npm run db:generate`                                    |
 | Push schema                           | `npm run db:push`                                        |
 
 
 **Environment variables (typical):**
 
-- `**FOOTBALL_DATA_API_KEY`** — Football-Data.org  
-- `**ODDS_API_KEY`** — The Odds API  
-- `**DATABASE_URL`** — Prisma connection string
+- `**DATABASE_URL`** — Prisma connection string (see `.env.example`).
+- `**FOOTBALL_DATA_API_KEY`** — Football-Data.org (`ingest`, `daily`).
+- `**ODDS_API_KEY`** — The Odds API (`refreshOddsForUpcomingFixtures`, value picks); optional — odds steps no-op when unset.
+- `**API_FOOTBALL_KEY`** — optional ping / future wiring (`api-client.ts`).
+- `**AHEAD_DAYS**` — upcoming fixture window for ingest (default from constants).
+- `**RESULTS_DAYS**` — how far back to pull results (default 7).
+- `**SKIP_UNDERSTAT**` — set `true` to skip Understat in `daily` / ingest.
+- `**CURRENT_SEASON**` — used by Understat scraper when set (see `understat-ingest.ts`).
 
 ---
 

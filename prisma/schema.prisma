@@ -112,7 +112,12 @@ model Fixture {
   matchImportances       MatchImportance[]
   matchContextFlags      MatchContextFlag[]
   oddsSnapshots          OddsSnapshot[]
+  oddsObservations       OddsObservation[]
   valuePicks             ValuePick[]
+  valuePickCandidates    ValuePickCandidate[]
+  betDecisions           BetDecision[]
+  featureSnapshots       FeatureSnapshot[]
+  featureSourceSnapshots FeatureSourceSnapshot[]
 }
 
 // ─── GRANULAR TEAM STATS (per team per match) ────────────────────
@@ -578,6 +583,52 @@ model OddsSnapshot {
   @@index([fixtureId, market, bookmaker])
 }
 
+model OddsObservation {
+  id              Int      @id @default(autoincrement())
+  fixtureId       Int
+  bookmaker       String
+  market          String
+  snapshotType    String
+  source          String   @default("odds_api_refresh")
+
+  outcome1        Float
+  outcome2        Float
+  outcome3        Float?
+
+  overround       Float    @default(0)
+  impliedProb1    Float    @default(0)
+  impliedProb2    Float    @default(0)
+  impliedProb3    Float?
+
+  observedAt      DateTime @default(now())
+
+  fixture         Fixture  @relation(fields: [fixtureId], references: [id])
+
+  @@unique([fixtureId, bookmaker, market, snapshotType, observedAt])
+  @@index([fixtureId, market, snapshotType, observedAt])
+  @@index([observedAt])
+}
+
+model OddsCaptureRun {
+  id               Int      @id @default(autoincrement())
+  source           String   @default("odds_api_refresh")
+  daysAhead        Int      @default(2)
+  status           String   @default("running")
+  sportResultsJson String   @default("[]")
+  eventsFetched    Int      @default(0)
+  fixturesTargeted Int      @default(0)
+  fixturesMatched  Int      @default(0)
+  fixturesUnmatched Int     @default(0)
+  snapshotsUpserted Int     @default(0)
+  observationsAdded Int     @default(0)
+  startedAt        DateTime @default(now())
+  completedAt      DateTime?
+  errorMessage     String?
+
+  @@index([startedAt])
+  @@index([status])
+}
+
 model ValuePick {
   id              Int      @id @default(autoincrement())
   fixtureId       Int
@@ -597,7 +648,7 @@ model ValuePick {
   quarterKelly    Float
   halfKelly       Float
 
-  /** Discrete stake size for settlement & ROI; null on legacy rows → use quarterKelly. */
+  // Discrete stake size for settlement and ROI; null on legacy rows uses quarterKelly.
   stakeUnits      Float?
 
   rating          Int      @default(1)
@@ -606,6 +657,8 @@ model ValuePick {
   closingOdds     Float?
   closingImplied  Float?
   closingLineValue Float?
+  // How closing-line fields were derived: real closing snapshot vs latest current fallback.
+  closingLineSnapshotKind String?
 
   outcome         String?
   profitLoss      Float?
@@ -616,9 +669,102 @@ model ValuePick {
 
   fixture  Fixture @relation(fields: [fixtureId], references: [id])
 
+  @@unique([fixtureId, market])
   @@index([fixtureId])
   @@index([flaggedAt])
   @@index([market])
+}
+
+model ValuePickRun {
+  id               Int      @id @default(autoincrement())
+  runType          String   @default("value_pick_recompute")
+  modelVersion     String
+  policyJson       String
+  daysAhead        Int      @default(2)
+  status           String   @default("running")
+  fixturesConsidered Int    @default(0)
+  acceptedCount    Int      @default(0)
+  rejectedCount    Int      @default(0)
+  startedAt        DateTime @default(now())
+  completedAt      DateTime?
+  errorMessage     String?
+
+  candidates       ValuePickCandidate[]
+
+  @@index([startedAt])
+  @@index([status])
+}
+
+model ValuePickCandidate {
+  id               Int      @id @default(autoincrement())
+  runId            Int
+  fixtureId        Int
+  market           String
+  bestBookmaker    String
+  accepted         Boolean  @default(false)
+  rejectionReasons String   @default("[]")
+  modelVersion     String
+  policyJson       String
+  modelProb        Float
+  modelConfidence  Float
+  bestOdds         Float
+  rawImpliedProb   Float
+  impliedProb      Float
+  edge             Float
+  edgePct          Float
+  expectedValue    Float
+  kellyFraction    Float
+  stakeUnits       Float?
+  rating           Int?
+  ratingLabel      String?
+  evaluatedAt      DateTime @default(now())
+
+  run              ValuePickRun @relation(fields: [runId], references: [id])
+  fixture          Fixture      @relation(fields: [fixtureId], references: [id])
+  betDecision      BetDecision?
+
+  @@index([runId, accepted])
+  @@index([fixtureId, market, evaluatedAt])
+  @@index([accepted, evaluatedAt])
+}
+
+model BetDecision {
+  id                    Int      @id @default(autoincrement())
+  candidateId           Int?     @unique
+  fixtureId             Int
+  market                String
+  source                String   @default("accepted_candidate")
+  modelVersion          String
+  policyJson            String
+  bestBookmaker         String
+  modelProb             Float
+  modelConfidence       Float
+  bestOdds              Float
+  rawImpliedProb        Float
+  impliedProb           Float
+  edge                  Float
+  edgePct               Float
+  expectedValue         Float
+  kellyFraction         Float
+  stakeUnits            Float?
+  rating                Int?
+  ratingLabel           String?
+  decidedAt             DateTime @default(now())
+  closingOdds           Float?
+  closingImplied        Float?
+  closingLineValue      Float?
+  closingLineSnapshotKind String?
+  outcome               String?
+  profitLoss            Float?
+  settled               Boolean  @default(false)
+  settledAt             DateTime?
+
+  candidate             ValuePickCandidate? @relation(fields: [candidateId], references: [id])
+  fixture               Fixture             @relation(fields: [fixtureId], references: [id])
+
+  @@unique([fixtureId, market])
+  @@index([decidedAt])
+  @@index([settled, decidedAt])
 }
 
 model BettingPerformance {
@@ -686,6 +832,66 @@ model PredictionAudit {
   logLoss         Float    @default(0)
   createdAt       DateTime @default(now())
 
+  @@unique([fixtureId, market])
   @@index([market])
   @@index([createdAt])
+}
+
+model ResearchRun {
+  id             Int      @id @default(autoincrement())
+  runType        String
+  version        String
+  status         String   @default("running")
+  paramsJson     String   @default("{}")
+  rowCount       Int      @default(0)
+  errorMessage   String?
+  startedAt      DateTime @default(now())
+  completedAt    DateTime?
+
+  featureSnapshots FeatureSnapshot[]
+
+  @@index([runType, startedAt])
+  @@index([status])
+}
+
+model FeatureSnapshot {
+  id                  Int      @id @default(autoincrement())
+  runId               Int?
+  fixtureId           Int
+  featureVersion      String
+  snapshotKind        String   @default("prematch")
+  asOfTime            DateTime
+  sourceTimestampsJson String  @default("{}")
+  sourceMaxTimestamp  DateTime?
+  featureJson         String
+  targetJson          String?
+  snapshotTrust       String   @default("unsafe_reconstructed")
+  leakageChecked      Boolean  @default(false)
+  leakageWarningsJson String   @default("[]")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @default(now())
+
+  run                 ResearchRun? @relation(fields: [runId], references: [id])
+  fixture             Fixture      @relation(fields: [fixtureId], references: [id])
+
+  @@unique([fixtureId, featureVersion, snapshotKind])
+  @@index([fixtureId, asOfTime])
+  @@index([featureVersion, snapshotKind])
+  @@index([snapshotTrust])
+  @@index([leakageChecked])
+}
+
+model FeatureSourceSnapshot {
+  id          Int      @id @default(autoincrement())
+  fixtureId   Int
+  source      String
+  capturedAt  DateTime @default(now())
+  asOfTime    DateTime
+  payloadJson String
+
+  fixture     Fixture  @relation(fields: [fixtureId], references: [id])
+
+  @@index([fixtureId, asOfTime])
+  @@index([fixtureId, source, capturedAt])
+  @@index([source, capturedAt])
 }

@@ -13,7 +13,7 @@ async function seed() {
     { id: "FL1", code: "FL1", name: "Ligue 1", country: "France", isEuropean: false },
     { id: "CL", code: "CL", name: "UEFA Champions League", country: "Europe", isEuropean: true },
     { id: "EC", code: "EC", name: "UEFA Europa League", country: "Europe", isEuropean: true },
-    { id: "CLI", code: "CLI", name: "UEFA Conference League", country: "Europe", isEuropean: true },
+    { id: "CLI", code: "CLI", name: "Copa Libertadores", country: "South America", isEuropean: false },
   ];
 
   for (const c of competitions) {

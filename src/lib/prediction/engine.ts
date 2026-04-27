@@ -17,7 +17,9 @@ import {
   computeContextFeatures,
   classifyTacticalMatchup,
   applyRegressionToMean,
-  computeLambda,
+  boundedMultiplier,
+  combineWeightedRate,
+  computeWeightedLambdaV3,
   type H2HFeatures,
 } from "./features";
 import {
@@ -33,6 +35,7 @@ import {
 import { computeSquadStrengthModifier } from "./rotation";
 import { isDerbyOrRivalry } from "../data/rivalries";
 import { dixonColesRhoBase, htGoalShare } from "./league-params";
+import { ENGINE_LEAGUE_AVG_XG, ENGINE_MODEL_VERSION, ENGINE_V3_CONFIG } from "./model-config";
 
 export interface PredictionResult {
   fixtureId: number;
@@ -63,7 +66,11 @@ export interface PredictionResult {
   topScorelines: Array<{ home: number; away: number; prob: number }>;
 
   modelConfidence: number;
-  featureWeights: Record<string, number>;
+  /** Per-side λ multipliers (diagnostics); symmetric home/away structure. */
+  featureWeights: {
+    home: Record<string, number>;
+    away: Record<string, number>;
+  };
   featureBreakdown: FeatureBreakdown;
   insights: string[];
 }
@@ -82,8 +89,8 @@ interface FeatureBreakdown {
   tacticalStyle: string;
 }
 
-export const MODEL_VERSION = "v2.0-dc-poisson";
-const LEAGUE_AVG_XG = 1.35;
+export const MODEL_VERSION = ENGINE_MODEL_VERSION;
+const LEAGUE_AVG_XG = ENGINE_LEAGUE_AVG_XG;
 const PREDICTION_CACHE_HOURS = 6;
 
 const EUROPEAN_COMPETITIONS = new Set(["CL", "EC", "CLI"]);
@@ -121,21 +128,24 @@ function squadModFromAvailability(
   return computeSquadStrengthModifier(rows, teamXgPerGame);
 }
 
+function seasonAttackRate(
+  stats: { xgFor: number; goalsScored: number; matchesPlayed: number } | null,
+): number | null {
+  if (!stats || stats.matchesPlayed <= 0) return null;
+  if (stats.xgFor > 0) return stats.xgFor / stats.matchesPlayed;
+  return stats.goalsScored / stats.matchesPlayed;
+}
+
+function seasonDefenseRate(
+  stats: { xgAgainst: number; goalsConceded: number; matchesPlayed: number } | null,
+): number | null {
+  if (!stats || stats.matchesPlayed <= 0) return null;
+  if (stats.xgAgainst > 0) return stats.xgAgainst / stats.matchesPlayed;
+  return stats.goalsConceded / stats.matchesPlayed;
+}
+
 export async function predictMatch(fixtureId: number): Promise<PredictionResult> {
   // ── Check cache (Bug 5) ───────────────────────────────────
-  const cached = await prisma.prediction.findFirst({
-    where: { fixtureId, modelVersion: MODEL_VERSION },
-    orderBy: { createdAt: "desc" },
-  });
-
-  if (cached) {
-    const refTime = cached.updatedAt ?? cached.createdAt;
-    const ageMs = Date.now() - refTime.getTime();
-    if (ageMs < PREDICTION_CACHE_HOURS * 60 * 60 * 1000) {
-      return reconstructPredictionResult(cached, fixtureId);
-    }
-  }
-
   const fixture = await prisma.fixture.findUnique({
     where: { id: fixtureId },
     include: {
@@ -146,6 +156,31 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
   });
 
   if (!fixture) throw new Error(`Fixture ${fixtureId} not found`);
+
+  const kickoff = new Date(fixture.utcDate);
+  const fixtureStarted = kickoff.getTime() <= Date.now();
+
+  const cached = await prisma.prediction.findFirst({
+    where: { fixtureId, modelVersion: MODEL_VERSION },
+    orderBy: { updatedAt: "desc" },
+  });
+
+  if (cached) {
+    if (fixtureStarted) {
+      return reconstructPredictionResult(cached, fixtureId);
+    }
+    const refTime = cached.updatedAt ?? cached.createdAt;
+    const ageMs = Date.now() - refTime.getTime();
+    if (ageMs < PREDICTION_CACHE_HOURS * 60 * 60 * 1000) {
+      return reconstructPredictionResult(cached, fixtureId);
+    }
+  }
+
+  if (fixtureStarted) {
+    throw new Error(
+      `Prediction snapshot unavailable for started fixture ${fixtureId}; refusing post-match recomputation`,
+    );
+  }
 
   const isEuropean = EUROPEAN_COMPETITIONS.has(fixture.competitionId);
   const homeAdvGoals = HOME_ADVANTAGE_GOALS_BY_LEAGUE[fixture.competitionId] ?? 0.25;
@@ -179,13 +214,19 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
       where: { teamId: fixture.awayTeamId, competitionId: awayStatsCompId, season: CURRENT_SEASON },
     }),
     prisma.teamMatchStats.findMany({
-      where: { teamId: fixture.homeTeamId },
+      where: {
+        teamId: fixture.homeTeamId,
+        fixture: { utcDate: { lt: kickoff } },
+      },
       orderBy: { fixture: { utcDate: "desc" } },
       take: 15,
       include: { fixture: { select: { utcDate: true, competitionId: true } } },
     }),
     prisma.teamMatchStats.findMany({
-      where: { teamId: fixture.awayTeamId },
+      where: {
+        teamId: fixture.awayTeamId,
+        fixture: { utcDate: { lt: kickoff } },
+      },
       orderBy: { fixture: { utcDate: "desc" } },
       take: 15,
       include: { fixture: { select: { utcDate: true, competitionId: true } } },
@@ -256,7 +297,11 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     : [fixture.awayTeamId, fixture.homeTeamId];
 
   const h2hMatches = await prisma.h2HMatch.findMany({
-    where: { teamAId: idA, teamBId: idB },
+    where: {
+      teamAId: idA,
+      teamBId: idB,
+      date: { lt: kickoff },
+    },
     orderBy: { date: "desc" },
     take: 10,
   });
@@ -288,7 +333,11 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
   const homeForm = computeFormFeatures(homeMatchStats, homeSeasonStats);
   const awayForm = computeFormFeatures(awayMatchStats, awaySeasonStats);
 
-  const h2hFeatures = computeH2HFeatures(h2hMatches, idA, fixture.homeTeamId);
+  const h2hFeatures = computeH2HFeatures(
+    h2hMatches,
+    fixture.homeTeamId,
+    fixture.awayTeamId,
+  );
 
   const homeXgTotal = homeSeasonStats ? homeSeasonStats.xgFor / Math.max(homeSeasonStats.matchesPlayed, 1) : LEAGUE_AVG_XG;
   const awayXgTotal = awaySeasonStats ? awaySeasonStats.xgFor / Math.max(awaySeasonStats.matchesPlayed, 1) : LEAGUE_AVG_XG;
@@ -301,7 +350,6 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
   const lastAwayMatch = awayMatchStats[0];
   const lastAwayDate = lastAwayMatch ? new Date(lastAwayMatch.fixture.utcDate) : null;
 
-  const kickoff = new Date(fixture.utcDate);
   const priorMatchWasEuropean = (
     stats: typeof homeMatchStats,
   ): boolean => {
@@ -319,6 +367,7 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     awaySeasonStats,
     lastHomeDate,
     isAfterEuropean,
+    kickoff,
   );
 
   const tactical = classifyTacticalMatchup(
@@ -328,146 +377,201 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
 
   // ── Compute lambdas ────────────────────────────────────────
 
-  const homeAttackRating = homeAttack.attackRatingOverall ?? LEAGUE_AVG_XG;
-  const awayAttackRating = awayAttack.attackRatingOverall ?? LEAGUE_AVG_XG;
-  const homeDefRating = homeDefense.defenseRatingOverall ?? LEAGUE_AVG_XG;
-  const awayDefRating = awayDefense.defenseRatingOverall ?? LEAGUE_AVG_XG;
   const matchday = fixture.matchday ?? 20;
 
-  // If no match-level stats, fall back to season stats
-  let homeXgPerGame: number;
-  let awayXgPerGame: number;
-  let homeXgaPerGame: number;
-  let awayXgaPerGame: number;
+  const homeAttackRate = combineWeightedRate({
+    recentOverall: homeAttack.attackRatingOverall,
+    recentVenue: homeAttack.attackRatingVenue,
+    season: seasonAttackRate(homeSeasonStats),
+    leaguePrior: LEAGUE_AVG_XG,
+    weights: ENGINE_V3_CONFIG.rateWeights,
+  });
+  const awayAttackRate = combineWeightedRate({
+    recentOverall: awayAttack.attackRatingOverall,
+    recentVenue: awayAttack.attackRatingVenue,
+    season: seasonAttackRate(awaySeasonStats),
+    leaguePrior: LEAGUE_AVG_XG,
+    weights: ENGINE_V3_CONFIG.rateWeights,
+  });
+  const homeDefenseRate = combineWeightedRate({
+    recentOverall: homeDefense.defenseRatingOverall,
+    recentVenue: homeDefense.defenseRatingVenue,
+    season: seasonDefenseRate(homeSeasonStats),
+    leaguePrior: LEAGUE_AVG_XG,
+    weights: ENGINE_V3_CONFIG.rateWeights,
+  });
+  const awayDefenseRate = combineWeightedRate({
+    recentOverall: awayDefense.defenseRatingOverall,
+    recentVenue: awayDefense.defenseRatingVenue,
+    season: seasonDefenseRate(awaySeasonStats),
+    leaguePrior: LEAGUE_AVG_XG,
+    weights: ENGINE_V3_CONFIG.rateWeights,
+  });
 
-  if (homeMatchStats.length > 0) {
-    homeXgPerGame = homeAttackRating;
-    homeXgaPerGame = homeDefRating;
-  } else if (homeSeasonStats && homeSeasonStats.matchesPlayed > 0) {
-    homeXgPerGame = homeSeasonStats.xgFor > 0
-      ? homeSeasonStats.xgFor / homeSeasonStats.matchesPlayed
-      : homeSeasonStats.goalsScored / homeSeasonStats.matchesPlayed;
-    homeXgaPerGame = homeSeasonStats.xgAgainst > 0
-      ? homeSeasonStats.xgAgainst / homeSeasonStats.matchesPlayed
-      : homeSeasonStats.goalsConceded / homeSeasonStats.matchesPlayed;
-  } else {
-    homeXgPerGame = LEAGUE_AVG_XG;
-    homeXgaPerGame = LEAGUE_AVG_XG;
-  }
-
-  if (awayMatchStats.length > 0) {
-    awayXgPerGame = awayAttackRating;
-    awayXgaPerGame = awayDefRating;
-  } else if (awaySeasonStats && awaySeasonStats.matchesPlayed > 0) {
-    awayXgPerGame = awaySeasonStats.xgFor > 0
-      ? awaySeasonStats.xgFor / awaySeasonStats.matchesPlayed
-      : awaySeasonStats.goalsScored / awaySeasonStats.matchesPlayed;
-    awayXgaPerGame = awaySeasonStats.xgAgainst > 0
-      ? awaySeasonStats.xgAgainst / awaySeasonStats.matchesPlayed
-      : awaySeasonStats.goalsConceded / awaySeasonStats.matchesPlayed;
-  } else {
-    awayXgPerGame = LEAGUE_AVG_XG;
-    awayXgaPerGame = LEAGUE_AVG_XG;
-  }
+  const homeXgPerGame = homeAttackRate.value;
+  const awayXgPerGame = awayAttackRate.value;
+  const homeXgaPerGame = homeDefenseRate.value;
+  const awayXgaPerGame = awayDefenseRate.value;
 
   // Regression to mean — clamped to [0.75, 1.25] to prevent extreme swings
   const homeRegressionRaw = applyRegressionToMean(
     homeXgPerGame, homeForm.xgOverperformance ?? 0, matchday, LEAGUE_AVG_XG,
   ) / Math.max(homeXgPerGame, 0.01);
-  const homeRegression = Math.max(0.75, Math.min(1.25, homeRegressionRaw));
+  const homeRegression = boundedMultiplier(
+    homeRegressionRaw,
+    ENGINE_V3_CONFIG.modifierCaps.regression.min,
+    ENGINE_V3_CONFIG.modifierCaps.regression.max,
+  );
 
   const awayRegressionRaw = applyRegressionToMean(
     awayXgPerGame, awayForm.xgOverperformance ?? 0, matchday, LEAGUE_AVG_XG,
   ) / Math.max(awayXgPerGame, 0.01);
-  const awayRegression = Math.max(0.75, Math.min(1.25, awayRegressionRaw));
+  const awayRegression = boundedMultiplier(
+    awayRegressionRaw,
+    ENGINE_V3_CONFIG.modifierCaps.regression.min,
+    ENGINE_V3_CONFIG.modifierCaps.regression.max,
+  );
 
   // Squad / injury: prefer probabilistic rotation model when availability rows exist
   const homeInjuryFallback = 1 - (homeSquad.missingPlayersXgShare ?? 0);
   const awayInjuryFallback = 1 - (awaySquad.missingPlayersXgShare ?? 0);
 
-  const homeSquadMod = squadModFromAvailability(
-    homePlayers,
-    homeAvailability,
-    homeXgTotal,
-    homeInjuryFallback,
+  const homeSquadMod = boundedMultiplier(
+    squadModFromAvailability(
+      homePlayers,
+      homeAvailability,
+      homeXgTotal,
+      homeInjuryFallback,
+    ),
+    ENGINE_V3_CONFIG.modifierCaps.squad.min,
+    ENGINE_V3_CONFIG.modifierCaps.squad.max,
   );
-  const awaySquadMod = squadModFromAvailability(
-    awayPlayers,
-    awayAvailability,
-    awayXgTotal,
-    awayInjuryFallback,
+  const awaySquadMod = boundedMultiplier(
+    squadModFromAvailability(
+      awayPlayers,
+      awayAvailability,
+      awayXgTotal,
+      awayInjuryFallback,
+    ),
+    ENGINE_V3_CONFIG.modifierCaps.squad.min,
+    ENGINE_V3_CONFIG.modifierCaps.squad.max,
   );
 
   // Form modifiers (xG trend only — motivation handled via MatchImportance)
-  const homeFormMod = Math.max(0.85, Math.min(1.15, 1 + (homeForm.formXgTrend ?? 0) * 0.5));
-  const awayFormMod = Math.max(0.85, Math.min(1.15, 1 + (awayForm.formXgTrend ?? 0) * 0.5));
+  const homeFormMod = boundedMultiplier(
+    1 + (homeForm.formXgTrend ?? 0) * ENGINE_V3_CONFIG.impacts.formSlope,
+    ENGINE_V3_CONFIG.modifierCaps.form.min,
+    ENGINE_V3_CONFIG.modifierCaps.form.max,
+  );
+  const awayFormMod = boundedMultiplier(
+    1 + (awayForm.formXgTrend ?? 0) * ENGINE_V3_CONFIG.impacts.formSlope,
+    ENGINE_V3_CONFIG.modifierCaps.form.min,
+    ENGINE_V3_CONFIG.modifierCaps.form.max,
+  );
 
-  const homeMotivationMod = homeImportance?.lambdaModifier ?? 1.0;
-  const awayMotivationMod = awayImportance?.lambdaModifier ?? 1.0;
+  const homeMotivationMod = boundedMultiplier(
+    homeImportance?.lambdaModifier ?? 1.0,
+    ENGINE_V3_CONFIG.modifierCaps.motivation.min,
+    ENGINE_V3_CONFIG.modifierCaps.motivation.max,
+  );
+  const awayMotivationMod = boundedMultiplier(
+    awayImportance?.lambdaModifier ?? 1.0,
+    ENGINE_V3_CONFIG.modifierCaps.motivation.min,
+    ENGINE_V3_CONFIG.modifierCaps.motivation.max,
+  );
 
   const matchLevelMod = matchLevelFlags.reduce((m, f) => m * f.lambdaMultiplier, 1.0);
   const homeContextMod = Math.max(
-    0.8,
+    ENGINE_V3_CONFIG.modifierCaps.context.min,
     Math.min(
-      1.15,
+      ENGINE_V3_CONFIG.modifierCaps.context.max,
       homeContextFlags.reduce((m, f) => m * f.lambdaMultiplier, 1.0) * matchLevelMod,
     ),
   );
   const awayContextMod = Math.max(
-    0.8,
+    ENGINE_V3_CONFIG.modifierCaps.context.min,
     Math.min(
-      1.15,
+      ENGINE_V3_CONFIG.modifierCaps.context.max,
       awayContextFlags.reduce((m, f) => m * f.lambdaMultiplier, 1.0) * matchLevelMod,
     ),
   );
 
   // H2H modifiers (shrunk toward 1.0 by sample size, capped ±10%)
-  const h2hWeight = Math.min(1.0, h2hFeatures.totalMeetings / 10);
-  const homeH2hAdj = h2hWeight * (h2hFeatures.homeWinRate - 0.45);
-  const awayH2hAdj = h2hWeight * (h2hFeatures.awayWinRate - 0.28);
-  const homeH2hMod = Math.max(0.90, Math.min(1.10, 1 + homeH2hAdj * 0.3));
-  const awayH2hMod = Math.max(0.90, Math.min(1.10, 1 + awayH2hAdj * 0.3));
+  const h2hWeight = Math.min(
+    1.0,
+    h2hFeatures.totalMeetings / ENGINE_V3_CONFIG.h2hBaselines.fullSample,
+  );
+  const homeH2hAdj =
+    h2hWeight * (h2hFeatures.homeWinRate - ENGINE_V3_CONFIG.h2hBaselines.homeWinRate);
+  const awayH2hAdj =
+    h2hWeight * (h2hFeatures.awayWinRate - ENGINE_V3_CONFIG.h2hBaselines.awayWinRate);
+  const homeH2hMod = boundedMultiplier(
+    1 + homeH2hAdj * ENGINE_V3_CONFIG.impacts.h2h,
+    ENGINE_V3_CONFIG.modifierCaps.h2h.min,
+    ENGINE_V3_CONFIG.modifierCaps.h2h.max,
+  );
+  const awayH2hMod = boundedMultiplier(
+    1 + awayH2hAdj * ENGINE_V3_CONFIG.impacts.h2h,
+    ENGINE_V3_CONFIG.modifierCaps.h2h.min,
+    ENGINE_V3_CONFIG.modifierCaps.h2h.max,
+  );
 
   // Fatigue — graduated congestion model when precomputed rows exist
   const homeDaysSinceLast = contextFeatures.daysSinceLastMatch ?? 7;
   const awayDaysSinceLast = lastAwayDate
-    ? (Date.now() - lastAwayDate.getTime()) / (1000 * 60 * 60 * 24)
+    ? (kickoff.getTime() - lastAwayDate.getTime()) / (1000 * 60 * 60 * 24)
     : 7;
-  const homeFatigueMod =
-    homeCongestion?.fatigueModifier ??
-    (homeDaysSinceLast < 3 ? 0.95 : 1.0);
-  const awayFatigueMod =
-    awayCongestion?.fatigueModifier ??
-    (awayDaysSinceLast < 3 ? 0.95 : 1.0);
+  const homeFatigueMod = boundedMultiplier(
+    homeCongestion?.fatigueModifier ?? (homeDaysSinceLast < 3 ? 0.95 : 1.0),
+    ENGINE_V3_CONFIG.modifierCaps.fatigue.min,
+    ENGINE_V3_CONFIG.modifierCaps.fatigue.max,
+  );
+  const awayFatigueMod = boundedMultiplier(
+    awayCongestion?.fatigueModifier ?? (awayDaysSinceLast < 3 ? 0.95 : 1.0),
+    ENGINE_V3_CONFIG.modifierCaps.fatigue.min,
+    ENGINE_V3_CONFIG.modifierCaps.fatigue.max,
+  );
 
   // Compute final lambdas
-  const lambdaHome = computeLambda({
+  const homeLambdaResult = computeWeightedLambdaV3({
     attackRating: homeXgPerGame,
     opponentDefenseRating: awayXgaPerGame,
     isHome: true,
     homeAdvantageGoals: homeAdvGoals,
-    injuryModifier: homeSquadMod,
-    formModifier: homeFormMod,
-    h2hModifier: homeH2hMod,
-    fatigueModifier: homeFatigueMod,
-    motivationModifier: homeMotivationMod,
-    contextModifier: homeContextMod,
-    regressionModifier: homeRegression,
+    leagueAvgXg: ENGINE_V3_CONFIG.leagueAvgXg,
+    modifiers: {
+      squadStrengthModifier: homeSquadMod,
+      formModifier: homeFormMod,
+      h2hModifier: homeH2hMod,
+      fatigueModifier: homeFatigueMod,
+      motivationModifier: homeMotivationMod,
+      contextModifier: homeContextMod,
+      regressionModifier: homeRegression,
+    },
+    minLambda: ENGINE_V3_CONFIG.lambdaCaps.min,
+    maxLambda: ENGINE_V3_CONFIG.lambdaCaps.max,
   });
 
-  const lambdaAway = computeLambda({
+  const awayLambdaResult = computeWeightedLambdaV3({
     attackRating: awayXgPerGame,
     opponentDefenseRating: homeXgaPerGame,
     isHome: false,
     homeAdvantageGoals: homeAdvGoals,
-    injuryModifier: awaySquadMod,
-    formModifier: awayFormMod,
-    h2hModifier: awayH2hMod,
-    fatigueModifier: awayFatigueMod,
-    motivationModifier: awayMotivationMod,
-    contextModifier: awayContextMod,
-    regressionModifier: awayRegression,
+    leagueAvgXg: ENGINE_V3_CONFIG.leagueAvgXg,
+    modifiers: {
+      squadStrengthModifier: awaySquadMod,
+      formModifier: awayFormMod,
+      h2hModifier: awayH2hMod,
+      fatigueModifier: awayFatigueMod,
+      motivationModifier: awayMotivationMod,
+      contextModifier: awayContextMod,
+      regressionModifier: awayRegression,
+    },
+    minLambda: ENGINE_V3_CONFIG.lambdaCaps.min,
+    maxLambda: ENGINE_V3_CONFIG.lambdaCaps.max,
   });
+  const lambdaHome = homeLambdaResult.lambda;
+  const lambdaAway = awayLambdaResult.lambda;
 
   // ── Build predictions ──────────────────────────────────────
 
@@ -575,13 +679,46 @@ export async function predictMatch(fixtureId: number): Promise<PredictionResult>
     topScorelines: topLines.map((l) => ({ ...l, prob: round4(l.prob) })),
     modelConfidence: round4(confidence),
     featureWeights: {
-      squadStrengthModifier: round4(homeSquadMod),
-      formModifier: round4(homeFormMod),
-      motivationModifier: round4(homeMotivationMod),
-      contextModifier: round4(homeContextMod),
-      h2hModifier: round4(homeH2hMod),
-      fatigueModifier: round4(homeFatigueMod),
-      regressionModifier: round4(homeRegression),
+      home: {
+        attackRecentOverallWeight: round4(homeAttackRate.weights.recentOverall),
+        attackRecentVenueWeight: round4(homeAttackRate.weights.recentVenue),
+        attackSeasonWeight: round4(homeAttackRate.weights.season),
+        attackLeaguePriorWeight: round4(homeAttackRate.weights.leaguePrior),
+        defenseRecentOverallWeight: round4(homeDefenseRate.weights.recentOverall),
+        defenseRecentVenueWeight: round4(homeDefenseRate.weights.recentVenue),
+        defenseSeasonWeight: round4(homeDefenseRate.weights.season),
+        defenseLeaguePriorWeight: round4(homeDefenseRate.weights.leaguePrior),
+        baseLambda: round4(homeLambdaResult.baseLambda),
+        combinedModifier: round4(homeLambdaResult.combinedModifier),
+        homeAdvantageAdjustment: round4(homeLambdaResult.homeAdvantageAdjustment),
+        squadStrengthModifier: round4(homeSquadMod),
+        formModifier: round4(homeFormMod),
+        motivationModifier: round4(homeMotivationMod),
+        contextModifier: round4(homeContextMod),
+        h2hModifier: round4(homeH2hMod),
+        fatigueModifier: round4(homeFatigueMod),
+        regressionModifier: round4(homeRegression),
+      },
+      away: {
+        attackRecentOverallWeight: round4(awayAttackRate.weights.recentOverall),
+        attackRecentVenueWeight: round4(awayAttackRate.weights.recentVenue),
+        attackSeasonWeight: round4(awayAttackRate.weights.season),
+        attackLeaguePriorWeight: round4(awayAttackRate.weights.leaguePrior),
+        defenseRecentOverallWeight: round4(awayDefenseRate.weights.recentOverall),
+        defenseRecentVenueWeight: round4(awayDefenseRate.weights.recentVenue),
+        defenseSeasonWeight: round4(awayDefenseRate.weights.season),
+        defenseLeaguePriorWeight: round4(awayDefenseRate.weights.leaguePrior),
+        baseLambda: round4(awayLambdaResult.baseLambda),
+        combinedModifier: round4(awayLambdaResult.combinedModifier),
+        homeAdvantageAdjustment: round4(awayLambdaResult.homeAdvantageAdjustment),
+        squadStrengthModifier: round4(awaySquadMod),
+        formModifier: round4(awayFormMod),
+        motivationModifier: round4(awayMotivationMod),
+        contextModifier: round4(awayContextMod),
+        h2hModifier: round4(awayH2hMod),
+        fatigueModifier: round4(awayFatigueMod),
+        regressionModifier: round4(awayRegression),
+      },
     },
     featureBreakdown: {
       homeAttack: round4(homeXgPerGame),
@@ -610,6 +747,47 @@ function round4(n: number): number {
 }
 
 // ─── CACHE RECONSTRUCTION ────────────────────────────────────
+
+function parseStoredFeatureWeights(json: string): PredictionResult["featureWeights"] {
+  const raw = JSON.parse(json || "{}") as Record<string, unknown>;
+  if (
+    raw.home &&
+    raw.away &&
+    typeof raw.home === "object" &&
+    typeof raw.away === "object"
+  ) {
+    return raw as PredictionResult["featureWeights"];
+  }
+  const l = raw as Partial<{
+    squadStrengthModifier: number;
+    formModifier: number;
+    motivationModifier: number;
+    contextModifier: number;
+    h2hModifier: number;
+    fatigueModifier: number;
+    regressionModifier: number;
+  }>;
+  return {
+    home: {
+      squadStrengthModifier: l.squadStrengthModifier ?? 1,
+      formModifier: l.formModifier ?? 1,
+      motivationModifier: l.motivationModifier ?? 1,
+      contextModifier: l.contextModifier ?? 1,
+      h2hModifier: l.h2hModifier ?? 1,
+      fatigueModifier: l.fatigueModifier ?? 1,
+      regressionModifier: l.regressionModifier ?? 1,
+    },
+    away: {
+      squadStrengthModifier: 1,
+      formModifier: 1,
+      motivationModifier: 1,
+      contextModifier: 1,
+      h2hModifier: 1,
+      fatigueModifier: 1,
+      regressionModifier: 1,
+    },
+  };
+}
 
 function reconstructPredictionResult(
   cached: {
@@ -687,7 +865,7 @@ function reconstructPredictionResult(
     htFtProbabilities: JSON.parse(cached.htFtProbabilities || "{}"),
     topScorelines: topSorted,
     modelConfidence: cached.modelConfidence,
-    featureWeights: JSON.parse(cached.featureWeights || "{}"),
+    featureWeights: parseStoredFeatureWeights(cached.featureWeights),
     featureBreakdown: breakdown,
     insights: JSON.parse(cached.topInsights || "[]"),
   };

@@ -1,11 +1,13 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { meanHeadlineBrier } from "@/lib/calibration";
+import { buildValueBacktestReport } from "@/lib/odds/backtest";
 
 export async function GET() {
-  const [betting, buckets] = await Promise.all([
+  const [betting, buckets, valueBacktest] = await Promise.all([
     prisma.bettingPerformance.findMany({ orderBy: { updatedAt: "desc" }, take: 20 }),
     prisma.calibrationBucket.findMany({ orderBy: { market: "asc" }, take: 200 }),
+    buildValueBacktestReport(),
   ]);
 
   const audits = await prisma.predictionAudit.findMany({
@@ -22,6 +24,7 @@ export async function GET() {
   return NextResponse.json({
     betting,
     buckets,
+    valueBacktest,
     brierScore: headlineBrier ?? brierAllMarkets,
     brierScoreAllMarkets: brierAllMarkets,
     brierScoreHeadline: headlineBrier,

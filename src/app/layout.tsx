@@ -38,10 +38,16 @@ export default function RootLayout({
                 Value picks
               </a>
               <a
+                href="/results"
+                className="text-sm text-text-secondary transition-colors hover:text-text-primary"
+              >
+                Results
+              </a>
+              <a
                 href="/model-performance"
                 className="text-sm text-text-secondary transition-colors hover:text-text-primary"
               >
-                Model performance
+                Research
               </a>
               <a
                 href="/admin/flags"

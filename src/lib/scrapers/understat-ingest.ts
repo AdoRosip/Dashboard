@@ -10,6 +10,7 @@
  */
 
 import { PrismaClient } from "@prisma/client";
+import { CURRENT_SEASON, UNDERSTAT_LEAGUE_MAP } from "../constants";
 import {
   fetchLeagueData,
   fetchMatchData,
@@ -18,22 +19,11 @@ import {
   aggregateShotsByContext,
   computePpda,
   type UnderstatLeagueData,
-  type UnderstatFixture,
   type UnderstatTeamMatch,
 } from "./understat";
 import { matchTeamToDb, matchPlayerToDb } from "./name-mapping";
 
 const prisma = new PrismaClient();
-
-const UNDERSTAT_LEAGUES: Record<string, string> = {
-  PL: "EPL",
-  PD: "La_liga",
-  BL1: "Bundesliga",
-  SA: "Serie_A",
-  FL1: "Ligue_1",
-};
-
-const CURRENT_SEASON = process.env.CURRENT_SEASON || "2024";
 
 // ─── TEAM xG SEASON STATS ───────────────────────────────────────
 
@@ -44,7 +34,7 @@ const CURRENT_SEASON = process.env.CURRENT_SEASON || "2024";
 export async function ingestTeamXg() {
   console.log("[Understat] Ingesting team xG season data...");
 
-  for (const [compCode, usLeague] of Object.entries(UNDERSTAT_LEAGUES)) {
+  for (const [compCode, usLeague] of Object.entries(UNDERSTAT_LEAGUE_MAP)) {
     const data = await fetchLeagueData(usLeague, CURRENT_SEASON);
     if (!data) {
       console.log(`  ${compCode}: No data available`);
@@ -252,8 +242,10 @@ async function ingestTeamMatchHistory(
 ) {
   console.log(`  [Understat] Ingesting fixtures + match stats for ${compCode}...`);
 
-  let fixturesCreated = 0;
+  let fixturesLinked = 0;
+  let syntheticFixturesCreated = 0;
   let statsCreated = 0;
+  const fixtureIdByUnderstatId = new Map<string, number>();
 
   for (const usDate of data.dates) {
     if (!usDate.isResult) continue;
@@ -263,32 +255,22 @@ async function ingestTeamMatchHistory(
     if (!homeTeamId || !awayTeamId) continue;
 
     const matchDate = new Date(usDate.datetime.replace(" ", "T") + "Z");
-    const usFixtureId = 700000 + parseInt(usDate.id);
     const homeGoals = parseInt(usDate.goals.h) || 0;
     const awayGoals = parseInt(usDate.goals.a) || 0;
 
     try {
-      await prisma.fixture.upsert({
-        where: { id: usFixtureId },
-        update: {
-          status: "FINISHED",
-          scoreHomeFt: homeGoals,
-          scoreAwayFt: awayGoals,
-          winner: homeGoals > awayGoals ? "HOME" : homeGoals < awayGoals ? "AWAY" : "DRAW",
-        },
-        create: {
-          id: usFixtureId,
-          competitionId: compCode,
-          homeTeamId,
-          awayTeamId,
-          utcDate: matchDate,
-          status: "FINISHED",
-          scoreHomeFt: homeGoals,
-          scoreAwayFt: awayGoals,
-          winner: homeGoals > awayGoals ? "HOME" : homeGoals < awayGoals ? "AWAY" : "DRAW",
-        },
+      const resolved = await upsertUnderstatFixture({
+        understatId: usDate.id,
+        competitionId: compCode,
+        homeTeamId,
+        awayTeamId,
+        matchDate,
+        homeGoals,
+        awayGoals,
       });
-      fixturesCreated++;
+      fixtureIdByUnderstatId.set(usDate.id, resolved.fixtureId);
+      if (resolved.createdSynthetic) syntheticFixturesCreated++;
+      else fixturesLinked++;
     } catch {
       continue;
     }
@@ -313,7 +295,10 @@ async function ingestTeamMatchHistory(
     if (!homeTeamId || !awayTeamId) continue;
 
     const dateKey = usDate.datetime.slice(0, 10);
-    const usFixtureId = 700000 + parseInt(usDate.id);
+    const fixtureId =
+      fixtureIdByUnderstatId.get(usDate.id) ??
+      (await findCanonicalFixtureId(homeTeamId, awayTeamId, dateKey, compCode)) ??
+      700000 + parseInt(usDate.id);
 
     for (const [teamId, isHome] of [[homeTeamId, true], [awayTeamId, false]] as [number, boolean][]) {
       const key = dateKey + "_" + (isHome ? "home" : "away") + "_" + teamId;
@@ -330,14 +315,14 @@ async function ingestTeamMatchHistory(
 
       try {
         await prisma.teamMatchStats.upsert({
-          where: { fixtureId_teamId: { fixtureId: usFixtureId, teamId } },
+          where: { fixtureId_teamId: { fixtureId, teamId } },
           update: {
             xg: round(xg), xgAgainst: round(xga), ppda, deepCompletions: deep,
             goalsScored: scored, goalsConceded: missed,
             xgOverperformance: round(scored - xg),
           },
           create: {
-            fixtureId: usFixtureId, teamId, competitionId: compCode, isHome,
+            fixtureId, teamId, competitionId: compCode, isHome,
             xg: round(xg), xgAgainst: round(xga), ppda, deepCompletions: deep,
             goalsScored: scored, goalsConceded: missed,
             xgOverperformance: round(scored - xg),
@@ -350,7 +335,9 @@ async function ingestTeamMatchHistory(
     }
   }
 
-  console.log(`    Fixtures: ${fixturesCreated} upserted, TeamMatchStats: ${statsCreated} upserted`);
+  console.log(
+    `    Fixtures: ${fixturesLinked} linked, ${syntheticFixturesCreated} synthetic created, TeamMatchStats: ${statsCreated} upserted`,
+  );
 }
 
 // ─── MATCH-LEVEL DETAILED DATA (shots + rosters) ────────────────
@@ -621,7 +608,7 @@ export async function refreshUnderstat(detailDaysBack = 7) {
 
   await ingestTeamXg();
 
-  for (const [, usLeague] of Object.entries(UNDERSTAT_LEAGUES)) {
+  for (const [, usLeague] of Object.entries(UNDERSTAT_LEAGUE_MAP)) {
     const recentIds = await getRecentMatchIds(
       usLeague,
       CURRENT_SEASON,
@@ -641,32 +628,95 @@ export async function refreshUnderstat(detailDaysBack = 7) {
 
 // ─── HELPERS ─────────────────────────────────────────────────────
 
-function buildDateMatchMap(dates: UnderstatFixture[]) {
-  const map = new Map<string, UnderstatFixture>();
-  for (const d of dates) {
-    const dateKey = d.datetime.slice(0, 10);
-    map.set(dateKey + "_" + d.h.title, d);
-    map.set(dateKey + "_" + d.a.title, d);
-  }
-  return map;
-}
-
-async function findDbFixture(
-  teamId: number,
-  isHome: boolean,
+async function findCanonicalFixtureId(
+  homeTeamId: number,
+  awayTeamId: number,
   dateKey: string,
   compCode: string,
-) {
+): Promise<number | null> {
   const dayStart = new Date(dateKey + "T00:00:00Z");
   const dayEnd = new Date(dateKey + "T23:59:59Z");
 
-  return prisma.fixture.findFirst({
+  const fixture = await prisma.fixture.findFirst({
     where: {
       competitionId: compCode,
-      ...(isHome ? { homeTeamId: teamId } : { awayTeamId: teamId }),
+      homeTeamId,
+      awayTeamId,
       utcDate: { gte: dayStart, lt: dayEnd },
     },
+    orderBy: { id: "asc" },
+    select: { id: true },
   });
+  return fixture?.id ?? null;
+}
+
+async function upsertUnderstatFixture(params: {
+  understatId: string;
+  competitionId: string;
+  homeTeamId: number;
+  awayTeamId: number;
+  matchDate: Date;
+  homeGoals: number;
+  awayGoals: number;
+}): Promise<{ fixtureId: number; createdSynthetic: boolean }> {
+  const dateKey = params.matchDate.toISOString().slice(0, 10);
+  const canonicalFixtureId = await findCanonicalFixtureId(
+    params.homeTeamId,
+    params.awayTeamId,
+    dateKey,
+    params.competitionId,
+  );
+  const winner =
+    params.homeGoals > params.awayGoals
+      ? "HOME"
+      : params.homeGoals < params.awayGoals
+        ? "AWAY"
+        : "DRAW";
+
+  if (canonicalFixtureId != null) {
+    await prisma.fixture.update({
+      where: { id: canonicalFixtureId },
+      data: {
+        status: "FINISHED",
+        scoreHomeFt: params.homeGoals,
+        scoreAwayFt: params.awayGoals,
+        winner,
+      },
+    });
+    return { fixtureId: canonicalFixtureId, createdSynthetic: false };
+  }
+
+  const syntheticFixtureId = 700000 + parseInt(params.understatId);
+  const existingSynthetic = await prisma.fixture.findUnique({
+    where: { id: syntheticFixtureId },
+    select: { id: true },
+  });
+
+  await prisma.fixture.upsert({
+    where: { id: syntheticFixtureId },
+    update: {
+      status: "FINISHED",
+      scoreHomeFt: params.homeGoals,
+      scoreAwayFt: params.awayGoals,
+      winner,
+    },
+    create: {
+      id: syntheticFixtureId,
+      competitionId: params.competitionId,
+      homeTeamId: params.homeTeamId,
+      awayTeamId: params.awayTeamId,
+      utcDate: params.matchDate,
+      status: "FINISHED",
+      scoreHomeFt: params.homeGoals,
+      scoreAwayFt: params.awayGoals,
+      winner,
+    },
+  });
+
+  return {
+    fixtureId: syntheticFixtureId,
+    createdSynthetic: existingSynthetic == null,
+  };
 }
 
 function mapPosition(usPosition: string): string {

@@ -7,8 +7,7 @@ export const COMPETITIONS = [
   { code: "CL", id: "CL", name: "UEFA Champions League", country: "Europe", isEuropean: true },
   /** Internal id `EC` — football-data.org sends competition code **EL** for UEFA Europa League. */
   { code: "EC", id: "EC", name: "UEFA Europa League", country: "Europe", isEuropean: true },
-  /** Internal id `CLI` — football-data.org sends **UCL** for UEFA Conference League (not Champions League). */
-  { code: "CLI", id: "CLI", name: "UEFA Conference League", country: "Europe", isEuropean: true },
+  { code: "CLI", id: "CLI", name: "Copa Libertadores", country: "South America", isEuropean: false },
 ] as const;
 
 export const COMPETITION_CODES = COMPETITIONS.map((c) => c.code);
@@ -21,7 +20,13 @@ export const UNDERSTAT_LEAGUE_MAP: Record<string, string> = {
   FL1: "Ligue_1",
 };
 
-export const CURRENT_SEASON = "2025";
+function inferCurrentSeasonStartYear(now: Date = new Date()): number {
+  const year = now.getUTCFullYear();
+  return now.getUTCMonth() >= 6 ? year : year - 1;
+}
+
+export const CURRENT_SEASON =
+  process.env.CURRENT_SEASON ?? String(inferCurrentSeasonStartYear());
 
 /** Default lookahead for upcoming fixtures, odds, V2 pipeline, and value picks (day-to-day). */
 export const DEFAULT_UPCOMING_DAYS = 2;

@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/db";
 import { FixturesList } from "@/components/fixtures-list";
+import { MVP_SUPPORTED_COMPETITION_CODES } from "@/lib/mvp/config";
 
 export const dynamic = "force-dynamic";
 
@@ -9,6 +10,7 @@ export default async function HomePage() {
 
   const fixtures = await prisma.fixture.findMany({
     where: {
+      competitionId: { in: [...MVP_SUPPORTED_COMPETITION_CODES] },
       utcDate: { gte: now, lte: until },
       status: { in: ["SCHEDULED", "TIMED"] },
     },
@@ -25,6 +27,7 @@ export default async function HomePage() {
   });
 
   const competitions = await prisma.competition.findMany({
+    where: { code: { in: [...MVP_SUPPORTED_COMPETITION_CODES] } },
     orderBy: { name: "asc" },
   });
 
@@ -38,7 +41,7 @@ export default async function HomePage() {
         <div>
           <h1 className="text-2xl font-bold text-text-primary">Upcoming Fixtures</h1>
           <p className="mt-1 text-sm text-text-muted">
-            {fixtures.length} matches in the next 3 days
+            {fixtures.length} MVP-scope matches in the next 3 days
             {lastRefresh && (
               <span> · Last updated {new Date(lastRefresh.timestamp).toLocaleString()}</span>
             )}

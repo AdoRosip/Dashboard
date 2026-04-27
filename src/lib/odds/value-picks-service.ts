@@ -1,6 +1,47 @@
 import { prisma } from "../db";
-import { predictMatch } from "../prediction/engine";
-import { checkValue } from "./value";
+import {
+  MVP_PRODUCTION_POLICY,
+  MVP_PRODUCTION_POLICY_VERSION,
+  serializeMvpProductionPolicy,
+} from "../mvp/policy";
+import {
+  getProductionValuePrediction,
+  MVP_PRODUCTION_MODEL_ROUTING_VERSION,
+} from "../mvp/model-routing";
+import {
+  backfillBetDecisionsFromValuePicks,
+  createBetDecisionFromAcceptedCandidate,
+} from "./bet-decisions";
+import { buildValueMarketCandidates, SUPPORTED_VALUE_MARKETS } from "./value-candidates";
+import { evaluateValue, type ValueCheckResult } from "./value";
+import { MVP_SUPPORTED_COMPETITION_CODES } from "../mvp/config";
+
+type EvaluatedCandidate = {
+  candidate: ReturnType<typeof buildValueMarketCandidates>[number];
+  evaluation: ValueCheckResult;
+};
+
+function compareEvaluatedCandidates(a: EvaluatedCandidate, b: EvaluatedCandidate): number {
+  const evDiff = b.evaluation.metrics.expectedValue - a.evaluation.metrics.expectedValue;
+  if (evDiff !== 0) return evDiff;
+
+  const edgeDiff = b.evaluation.metrics.edge - a.evaluation.metrics.edge;
+  if (edgeDiff !== 0) return edgeDiff;
+
+  const confidenceDiff =
+    b.evaluation.metrics.modelConfidence - a.evaluation.metrics.modelConfidence;
+  if (confidenceDiff !== 0) return confidenceDiff;
+
+  return b.evaluation.metrics.bestOdds - a.evaluation.metrics.bestOdds;
+}
+
+export function chooseProduction1x2Candidate(
+  evaluated: EvaluatedCandidate[],
+): EvaluatedCandidate | null {
+  const qualifying = evaluated.filter((item) => item.evaluation.draft != null);
+  if (qualifying.length === 0) return null;
+  return qualifying.slice().sort(compareEvaluatedCandidates)[0] ?? null;
+}
 
 /**
  * Recompute value picks for upcoming fixtures using latest model + current odds snapshots.
@@ -8,135 +49,183 @@ import { checkValue } from "./value";
 export async function recomputeValuePicksForUpcoming(days = 2): Promise<number> {
   const now = new Date();
   const end = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+  const policyJson = serializeMvpProductionPolicy();
+
+  await backfillBetDecisionsFromValuePicks();
 
   const fixtures = await prisma.fixture.findMany({
     where: {
-      // Keep in sync with `refreshOddsForUpcomingFixtures` window & statuses
-      status: { in: ["SCHEDULED", "TIMED", "POSTPONED"] },
+      // Do not flag value on postponed/cancelled fixtures (settlement voids existing rows).
+      competitionId: { in: [...MVP_SUPPORTED_COMPETITION_CODES] },
+      status: { in: ["SCHEDULED", "TIMED"] },
       utcDate: { gte: now, lte: end },
     },
   });
 
+  const run = await prisma.valuePickRun.create({
+    data: {
+      modelVersion: `${MVP_PRODUCTION_MODEL_ROUTING_VERSION}:${MVP_PRODUCTION_POLICY_VERSION}`,
+      policyJson,
+      daysAhead: days,
+      fixturesConsidered: fixtures.length,
+    },
+    select: { id: true },
+  });
+
   let created = 0;
+  let acceptedCount = 0;
+  let rejectedCount = 0;
 
-  for (const fx of fixtures) {
-    let pred;
-    try {
-      pred = await predictMatch(fx.id);
-    } catch {
-      continue;
+  try {
+    for (const fx of fixtures) {
+      const validMarkets = new Set<string>();
+
+      let pred;
+      try {
+        pred = await getProductionValuePrediction(fx.id);
+      } catch {
+        continue;
+      }
+      const productionModelVersion = `${pred.modelVersion}:${MVP_PRODUCTION_POLICY_VERSION}`;
+
+      const snaps = await prisma.oddsSnapshot.findMany({
+        where: { fixtureId: fx.id, snapshotType: "current" },
+      });
+
+      const evaluatedCandidates = buildValueMarketCandidates(pred, snaps).map((candidate) => ({
+        candidate,
+        evaluation: evaluateValue(candidate, MVP_PRODUCTION_POLICY),
+      }));
+      const selectedCandidate = chooseProduction1x2Candidate(evaluatedCandidates);
+
+      for (const { candidate, evaluation } of evaluatedCandidates) {
+        const draft = evaluation.draft;
+        const accepted = selectedCandidate?.candidate.market === candidate.market && draft != null;
+        const rejectionReasons = accepted
+          ? evaluation.reasons
+          : draft
+            ? [...evaluation.reasons, "portfolio_not_best_1x2" as const]
+            : evaluation.reasons;
+        if (accepted) acceptedCount++;
+        else rejectedCount++;
+
+        const loggedCandidate = await prisma.valuePickCandidate.create({
+          data: {
+            runId: run.id,
+            fixtureId: fx.id,
+            market: candidate.market,
+            bestBookmaker: candidate.bestBookmaker,
+            accepted,
+            rejectionReasons: JSON.stringify(rejectionReasons),
+            modelVersion: productionModelVersion,
+            policyJson,
+            modelProb: evaluation.metrics.modelProb,
+            modelConfidence: evaluation.metrics.modelConfidence,
+            bestOdds: evaluation.metrics.bestOdds,
+            rawImpliedProb: evaluation.metrics.rawImpliedProb,
+            impliedProb: evaluation.metrics.impliedProb,
+            edge: evaluation.metrics.edge,
+            edgePct: evaluation.metrics.edgePct,
+            expectedValue: evaluation.metrics.expectedValue,
+            kellyFraction: evaluation.metrics.kellyFraction,
+            stakeUnits: draft?.stakeUnits ?? null,
+            rating: draft?.rating ?? null,
+            ratingLabel: draft?.ratingLabel ?? null,
+          },
+          select: { id: true },
+        });
+
+        if (!accepted || !draft) continue;
+
+        draft.bestBookmaker = candidate.bestBookmaker;
+        validMarkets.add(candidate.market);
+
+        await createBetDecisionFromAcceptedCandidate({
+          candidateId: loggedCandidate.id,
+          fixtureId: fx.id,
+          market: candidate.market,
+          modelVersion: productionModelVersion,
+          policyJson,
+          bestBookmaker: candidate.bestBookmaker,
+          modelProb: evaluation.metrics.modelProb,
+          modelConfidence: evaluation.metrics.modelConfidence,
+          bestOdds: evaluation.metrics.bestOdds,
+          rawImpliedProb: evaluation.metrics.rawImpliedProb,
+          impliedProb: evaluation.metrics.impliedProb,
+          edge: evaluation.metrics.edge,
+          edgePct: evaluation.metrics.edgePct,
+          expectedValue: evaluation.metrics.expectedValue,
+          kellyFraction: evaluation.metrics.kellyFraction,
+          stakeUnits: draft.stakeUnits,
+          rating: draft.rating,
+          ratingLabel: draft.ratingLabel,
+        });
+
+        const existingPick = await prisma.valuePick.findFirst({
+          where: { fixtureId: fx.id, market: candidate.market },
+          select: { id: true, settled: true },
+        });
+        if (existingPick?.settled) continue;
+
+        const payload = {
+          modelProb: draft.modelProb,
+          modelConfidence: draft.modelConfidence,
+          bestOdds: draft.bestOdds,
+          bestBookmaker: draft.bestBookmaker,
+          impliedProb: draft.impliedProb,
+          edge: draft.edge,
+          edgePct: draft.edgePct,
+          kellyFraction: draft.kellyFraction,
+          quarterKelly: draft.quarterKelly,
+          halfKelly: draft.halfKelly,
+          stakeUnits: draft.stakeUnits,
+          rating: draft.rating,
+          ratingLabel: draft.ratingLabel,
+        };
+        if (existingPick) {
+          await prisma.valuePick.update({
+            where: { id: existingPick.id },
+            data: payload,
+          });
+        } else {
+          await prisma.valuePick.create({
+            data: { fixtureId: fx.id, market: candidate.market, ...payload },
+          });
+        }
+        created++;
+      }
+
+      await prisma.valuePick.deleteMany({
+        where: {
+          fixtureId: fx.id,
+          settled: false,
+          market: { in: [...SUPPORTED_VALUE_MARKETS] },
+          NOT: { market: { in: Array.from(validMarkets) } },
+        },
+      });
     }
 
-    const snaps = await prisma.oddsSnapshot.findMany({
-      where: { fixtureId: fx.id, snapshotType: "current" },
+    await prisma.valuePickRun.update({
+      where: { id: run.id },
+      data: {
+        status: "completed",
+        acceptedCount,
+        rejectedCount,
+        completedAt: new Date(),
+      },
     });
-
-    const byMarket = new Map<string, typeof snaps>();
-    for (const s of snaps) {
-      const list = byMarket.get(s.market) ?? [];
-      list.push(s);
-      byMarket.set(s.market, list);
-    }
-
-    const markets: Array<{
-      key: string;
-      modelProb: number;
-      pickOutcome: "1" | "2" | "3";
-    }> = [
-      { key: "1x2_home", modelProb: pred.probHomeWin, pickOutcome: "1" },
-      { key: "1x2_draw", modelProb: pred.probDraw, pickOutcome: "2" },
-      { key: "1x2_away", modelProb: pred.probAwayWin, pickOutcome: "3" },
-      { key: "over25", modelProb: pred.probOver25, pickOutcome: "1" },
-      { key: "under25", modelProb: 1 - pred.probOver25, pickOutcome: "2" },
-    ];
-
-    for (const m of markets) {
-      let dbMarket = "";
-      let impliedProb = 0;
-      let bestOdds = 0;
-      let bestBook = "";
-
-      if (m.key.startsWith("1x2")) {
-        const list = byMarket.get("1x2") ?? [];
-        const pick = m.pickOutcome;
-        const perBm = list.map((s) => {
-          const odds =
-            pick === "1"
-              ? s.outcome1
-              : pick === "2"
-                ? s.outcome2
-                : s.outcome3 ?? s.outcome2;
-          const imp =
-            pick === "1"
-              ? s.impliedProb1
-              : pick === "2"
-                ? s.impliedProb2
-                : s.impliedProb3 ?? s.impliedProb2;
-          return { bookmaker: s.bookmaker, odds, implied: imp };
-        });
-        if (perBm.length === 0) continue;
-        const best = perBm.reduce((a, b) => (b.odds > a.odds ? b : a), perBm[0]!);
-        dbMarket = m.key;
-        impliedProb = best.implied;
-        bestOdds = best.odds;
-        bestBook = best.bookmaker;
-      } else if (m.key === "over25" || m.key === "under25") {
-        const list = byMarket.get("over_under_25") ?? [];
-        if (list.length === 0) continue;
-        const wantOver = m.key === "over25";
-        const perBm = list.map((s) => ({
-          bookmaker: s.bookmaker,
-          odds: wantOver ? s.outcome1 : s.outcome2,
-          implied: wantOver ? s.impliedProb1 : s.impliedProb2,
-        }));
-        const best = perBm.reduce((a, b) => (b.odds > a.odds ? b : a), perBm[0]!);
-        dbMarket = m.key;
-        impliedProb = best.implied;
-        bestOdds = best.odds;
-        bestBook = best.bookmaker;
-      }
-
-      if (!dbMarket || bestOdds <= 0) continue;
-
-      const draft = checkValue({
-        market: dbMarket,
-        modelProb: m.modelProb,
-        modelConfidence: pred.modelConfidence,
-        bestOdds,
-        impliedProb,
-      });
-      if (!draft) continue;
-
-      draft.bestBookmaker = bestBook;
-
-      const existing = await prisma.valuePick.findFirst({
-        where: { fixtureId: fx.id, market: dbMarket, settled: false },
-        select: { id: true },
-      });
-      const payload = {
-        modelProb: draft.modelProb,
-        modelConfidence: draft.modelConfidence,
-        bestOdds: draft.bestOdds,
-        bestBookmaker: draft.bestBookmaker,
-        impliedProb: draft.impliedProb,
-        edge: draft.edge,
-        edgePct: draft.edgePct,
-        kellyFraction: draft.kellyFraction,
-        quarterKelly: draft.quarterKelly,
-        halfKelly: draft.halfKelly,
-        stakeUnits: draft.stakeUnits,
-        rating: draft.rating,
-        ratingLabel: draft.ratingLabel,
-      };
-      if (existing) {
-        await prisma.valuePick.update({ where: { id: existing.id }, data: payload });
-      } else {
-        await prisma.valuePick.create({
-          data: { fixtureId: fx.id, market: dbMarket, ...payload },
-        });
-      }
-      created++;
-    }
+  } catch (error) {
+    await prisma.valuePickRun.update({
+      where: { id: run.id },
+      data: {
+        status: "failed",
+        acceptedCount,
+        rejectedCount,
+        errorMessage: error instanceof Error ? error.message : String(error),
+        completedAt: new Date(),
+      },
+    });
+    throw error;
   }
 
   return created;

@@ -1,22 +1,24 @@
 import { prisma } from "../db";
+import { backfillOddsObservationHistoryFromSnapshots, recordOddsObservation } from "./history";
 import { removeMargin } from "./margin";
 import { oddsSportKeyForCompetition } from "./sport-keys";
+import { remapH2hTripleToFixtureOrientation } from "./event-side";
+import {
+  isOddsEventSwappedVsFixture,
+  normalizeTeamName,
+  teamsMatchOddsEvent,
+} from "./team-normalize";
 
 const ODDS_API_BASE = "https://api.the-odds-api.com/v4";
 
 export interface FetchOddsResult {
   sportKey: string;
-  eventsProcessed: number;
+  eventsFetched: number;
+  fixturesTargeted: number;
+  fixturesMatched: number;
+  fixturesUnmatched: number;
+  unmatchedFixtures: string[];
   snapshotsUpserted: number;
-}
-
-function normalizeTeamName(s: string): string {
-  return s
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s]/g, "")
-    .trim();
 }
 
 function sameDay(a: Date, b: Date): boolean {
@@ -25,24 +27,6 @@ function sameDay(a: Date, b: Date): boolean {
     a.getUTCMonth() === b.getUTCMonth() &&
     a.getUTCDate() === b.getUTCDate()
   );
-}
-
-/** Loose match between API-Football / DB team name and Odds API team string. */
-export function teamsMatchOddsEvent(
-  dbHome: string,
-  dbAway: string,
-  oddsHome: string,
-  oddsAway: string,
-): boolean {
-  const h = normalizeTeamName(dbHome);
-  const a = normalizeTeamName(dbAway);
-  const oh = normalizeTeamName(oddsHome);
-  const oa = normalizeTeamName(oddsAway);
-  const direct =
-    (h.includes(oh) || oh.includes(h)) && (a.includes(oa) || oa.includes(a));
-  const swapped =
-    (h.includes(oa) || oa.includes(h)) && (a.includes(oh) || oh.includes(a));
-  return direct || swapped;
 }
 
 interface OddsOutcome {
@@ -100,7 +84,7 @@ async function createOpeningSnapshotIfMissing(params: {
   outcome1: number;
   outcome2: number;
   outcome3?: number | null;
-}) {
+}): Promise<number> {
   const exists = await prisma.oddsSnapshot.findFirst({
     where: {
       fixtureId: params.fixtureId,
@@ -109,7 +93,7 @@ async function createOpeningSnapshotIfMissing(params: {
       snapshotType: "opening",
     },
   });
-  if (exists) return;
+  if (exists) return 0;
 
   const prices =
     params.outcome3 != null && params.outcome3 > 0
@@ -133,6 +117,21 @@ async function createOpeningSnapshotIfMissing(params: {
       impliedProb3: implied.length > 2 ? implied[2] ?? null : null,
     },
   });
+
+  const added = await recordOddsObservation({
+    fixtureId: params.fixtureId,
+    bookmaker: params.bookmaker,
+    market: params.market,
+    snapshotType: "opening",
+    outcome1: params.outcome1,
+    outcome2: params.outcome2,
+    outcome3: params.outcome3 ?? null,
+    overround,
+    impliedProb1: implied[0] ?? 0,
+    impliedProb2: implied[1] ?? 0,
+    impliedProb3: implied.length > 2 ? implied[2] ?? null : null,
+  });
+  return added ? 1 : 0;
 }
 
 async function upsertCurrentSnapshot(params: {
@@ -142,7 +141,7 @@ async function upsertCurrentSnapshot(params: {
   outcome1: number;
   outcome2: number;
   outcome3?: number | null;
-}) {
+}): Promise<number> {
   const prices =
     params.outcome3 != null && params.outcome3 > 0
       ? [params.outcome1, params.outcome2, params.outcome3]
@@ -192,6 +191,86 @@ async function upsertCurrentSnapshot(params: {
       },
     });
   }
+
+  const added = await recordOddsObservation({
+    fixtureId: params.fixtureId,
+    bookmaker: params.bookmaker,
+    market: params.market,
+    snapshotType: "current",
+    outcome1: params.outcome1,
+    outcome2: params.outcome2,
+    outcome3: params.outcome3 ?? null,
+    overround,
+    impliedProb1: implied[0] ?? 0,
+    impliedProb2: implied[1] ?? 0,
+    impliedProb3: implied.length > 2 ? implied[2] ?? null : null,
+  });
+  return added ? 1 : 0;
+}
+
+async function upsertClosingSnapshot(params: {
+  fixtureId: number;
+  bookmaker: string;
+  market: string;
+  outcome1: number;
+  outcome2: number;
+  outcome3?: number | null;
+}): Promise<number> {
+  const prices =
+    params.outcome3 != null && params.outcome3 > 0
+      ? [params.outcome1, params.outcome2, params.outcome3]
+      : [params.outcome1, params.outcome2];
+  const implied = removeMargin(prices);
+  const overround = rawOverround(prices);
+
+  const payload = {
+    outcome1: params.outcome1,
+    outcome2: params.outcome2,
+    outcome3: params.outcome3 ?? null,
+    overround,
+    impliedProb1: implied[0] ?? 0,
+    impliedProb2: implied[1] ?? 0,
+    impliedProb3: implied.length > 2 ? implied[2] ?? null : null,
+    fetchedAt: new Date(),
+  };
+
+  const existing = await prisma.oddsSnapshot.findFirst({
+    where: {
+      fixtureId: params.fixtureId,
+      bookmaker: params.bookmaker,
+      market: params.market,
+      snapshotType: "closing",
+    },
+  });
+
+  if (existing) {
+    await prisma.oddsSnapshot.update({ where: { id: existing.id }, data: payload });
+  } else {
+    await prisma.oddsSnapshot.create({
+      data: {
+        fixtureId: params.fixtureId,
+        bookmaker: params.bookmaker,
+        market: params.market,
+        snapshotType: "closing",
+        ...payload,
+      },
+    });
+  }
+
+  const added = await recordOddsObservation({
+    fixtureId: params.fixtureId,
+    bookmaker: params.bookmaker,
+    market: params.market,
+    snapshotType: "closing",
+    outcome1: params.outcome1,
+    outcome2: params.outcome2,
+    outcome3: params.outcome3 ?? null,
+    overround,
+    impliedProb1: implied[0] ?? 0,
+    impliedProb2: implied[1] ?? 0,
+    impliedProb3: implied.length > 2 ? implied[2] ?? null : null,
+  });
+  return added ? 1 : 0;
 }
 
 /** Order: outcome1 home, outcome2 draw, outcome3 away */
@@ -224,32 +303,53 @@ function orderH2hPrices(
 
 async function processH2hBookmaker(
   fixtureId: number,
-  homeTeamName: string,
-  awayTeamName: string,
+  fixtureUtcDate: Date,
+  fixtureHomeName: string,
+  fixtureAwayName: string,
+  eventHomeName: string,
+  eventAwayName: string,
   bookmaker: OddsBookmaker,
-) {
+  eventSwappedVsFixture: boolean,
+): Promise<number> {
   const m = bookmaker.markets.find((x) => x.key === "h2h");
-  if (!m || m.outcomes.length < 3) return;
+  if (!m || m.outcomes.length < 3) return 0;
 
-  const ordered = orderH2hPrices(homeTeamName, awayTeamName, m.outcomes);
-  if (!ordered) return;
+  const orderedEvent = orderH2hPrices(eventHomeName, eventAwayName, m.outcomes);
+  if (!orderedEvent) return 0;
 
-  await createOpeningSnapshotIfMissing({
+  const [o1, o2, o3] = remapH2hTripleToFixtureOrientation(
+    orderedEvent,
+    eventSwappedVsFixture,
+  );
+
+  let observationsAdded = 0;
+  observationsAdded += await createOpeningSnapshotIfMissing({
     fixtureId,
     bookmaker: bookmaker.key,
     market: "1x2",
-    outcome1: ordered[0],
-    outcome2: ordered[1],
-    outcome3: ordered[2],
+    outcome1: o1,
+    outcome2: o2,
+    outcome3: o3,
   });
-  await upsertCurrentSnapshot({
+  observationsAdded += await upsertCurrentSnapshot({
     fixtureId,
     bookmaker: bookmaker.key,
     market: "1x2",
-    outcome1: ordered[0],
-    outcome2: ordered[1],
-    outcome3: ordered[2],
+    outcome1: o1,
+    outcome2: o2,
+    outcome3: o3,
   });
+  if (fixtureUtcDate.getTime() <= Date.now()) {
+    observationsAdded += await upsertClosingSnapshot({
+      fixtureId,
+      bookmaker: bookmaker.key,
+      market: "1x2",
+      outcome1: o1,
+      outcome2: o2,
+      outcome3: o3,
+    });
+  }
+  return observationsAdded;
 }
 
 function extractTotals25(bookmaker: OddsBookmaker): { over: number; under: number } | null {
@@ -266,91 +366,181 @@ function extractTotals25(bookmaker: OddsBookmaker): { over: number; under: numbe
   return { over: over.price, under: under.price };
 }
 
-async function processTotalsBookmaker(fixtureId: number, bookmaker: OddsBookmaker) {
+async function processTotalsBookmaker(
+  fixtureId: number,
+  fixtureUtcDate: Date,
+  bookmaker: OddsBookmaker,
+): Promise<number> {
   const t = extractTotals25(bookmaker);
-  if (!t) return;
-  await createOpeningSnapshotIfMissing({
+  if (!t) return 0;
+  let observationsAdded = 0;
+  observationsAdded += await createOpeningSnapshotIfMissing({
     fixtureId,
     bookmaker: bookmaker.key,
     market: "over_under_25",
     outcome1: t.over,
     outcome2: t.under,
   });
-  await upsertCurrentSnapshot({
+  observationsAdded += await upsertCurrentSnapshot({
     fixtureId,
     bookmaker: bookmaker.key,
     market: "over_under_25",
     outcome1: t.over,
     outcome2: t.under,
   });
+  if (fixtureUtcDate.getTime() <= Date.now()) {
+    observationsAdded += await upsertClosingSnapshot({
+      fixtureId,
+      bookmaker: bookmaker.key,
+      market: "over_under_25",
+      outcome1: t.over,
+      outcome2: t.under,
+    });
+  }
+  return observationsAdded;
 }
 
 /**
  * Fetch odds from The Odds API for upcoming fixtures (next `days` days) in DB.
  */
 export async function refreshOddsForUpcomingFixtures(days = 2): Promise<FetchOddsResult[]> {
-  const now = new Date();
-  const end = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
-
-  const fixtures = await prisma.fixture.findMany({
-    where: {
-      status: { in: ["SCHEDULED", "TIMED", "POSTPONED"] },
-      utcDate: { gte: now, lte: end },
+  await backfillOddsObservationHistoryFromSnapshots();
+  const run = await prisma.oddsCaptureRun.create({
+    data: {
+      daysAhead: days,
     },
-    include: { homeTeam: true, awayTeam: true },
+    select: { id: true },
   });
 
-  const bySport = new Map<string, typeof fixtures>();
-  for (const f of fixtures) {
-    const sk = oddsSportKeyForCompetition(f.competitionId);
-    if (!sk) continue;
-    const list = bySport.get(sk) ?? [];
-    list.push(f);
-    bySport.set(sk, list);
-  }
+  try {
+    const now = new Date();
+    const recentPast = new Date(now.getTime() - 6 * 60 * 60 * 1000);
+    const end = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
 
-  const results: FetchOddsResult[] = [];
-  let totalSnaps = 0;
+    const fixtures = await prisma.fixture.findMany({
+      where: {
+        status: { in: ["SCHEDULED", "TIMED", "POSTPONED"] },
+        utcDate: { gte: recentPast, lte: end },
+      },
+      include: { homeTeam: true, awayTeam: true },
+    });
 
-  for (const [sportKey, fixList] of bySport) {
-    const events = await fetchSportOdds(sportKey);
-    let processed = 0;
-    const snapBeforeSport = await prisma.oddsSnapshot.count();
-
-    for (const fx of fixList) {
-      const ev = events.find(
-        (e) =>
-          sameDay(new Date(e.commence_time), fx.utcDate) &&
-          teamsMatchOddsEvent(
-            fx.homeTeam.name,
-            fx.awayTeam.name,
-            e.home_team,
-            e.away_team,
-          ),
-      );
-      if (!ev) continue;
-      processed++;
-
-      for (const bm of ev.bookmakers) {
-        await processH2hBookmaker(fx.id, ev.home_team, ev.away_team, bm);
-        await processTotalsBookmaker(fx.id, bm);
-      }
+    const bySport = new Map<string, typeof fixtures>();
+    for (const f of fixtures) {
+      const sk = oddsSportKeyForCompetition(f.competitionId);
+      if (!sk) continue;
+      const list = bySport.get(sk) ?? [];
+      list.push(f);
+      bySport.set(sk, list);
     }
 
-    const snapAfterSport = await prisma.oddsSnapshot.count();
-    const sportSnaps = Math.max(0, snapAfterSport - snapBeforeSport);
-    totalSnaps += sportSnaps;
-    results.push({ sportKey, eventsProcessed: processed, snapshotsUpserted: sportSnaps });
+    const results: FetchOddsResult[] = [];
+    let totalSnaps = 0;
+    let totalEventsFetched = 0;
+    let totalFixturesTargeted = 0;
+    let totalMatched = 0;
+    let totalUnmatched = 0;
+    let totalObservationsAdded = 0;
+
+    for (const [sportKey, fixList] of bySport) {
+      const events = await fetchSportOdds(sportKey);
+      totalEventsFetched += events.length;
+      totalFixturesTargeted += fixList.length;
+      let matched = 0;
+      const unmatchedFixtures: string[] = [];
+      const snapBeforeSport = await prisma.oddsSnapshot.count();
+
+      for (const fx of fixList) {
+        const ev = events.find(
+          (e) =>
+            sameDay(new Date(e.commence_time), fx.utcDate) &&
+            teamsMatchOddsEvent(
+              fx.homeTeam.name,
+              fx.awayTeam.name,
+              e.home_team,
+              e.away_team,
+            ),
+        );
+        if (!ev) {
+          unmatchedFixtures.push(`${fx.homeTeam.name} vs ${fx.awayTeam.name}`);
+          continue;
+        }
+        matched++;
+
+        const eventSwapped = isOddsEventSwappedVsFixture(
+          fx.homeTeam.name,
+          fx.awayTeam.name,
+          ev.home_team,
+          ev.away_team,
+        );
+
+        for (const bm of ev.bookmakers) {
+          totalObservationsAdded += await processH2hBookmaker(
+            fx.id,
+            fx.utcDate,
+            fx.homeTeam.name,
+            fx.awayTeam.name,
+            ev.home_team,
+            ev.away_team,
+            bm,
+            eventSwapped,
+          );
+          totalObservationsAdded += await processTotalsBookmaker(fx.id, fx.utcDate, bm);
+        }
+      }
+
+      totalMatched += matched;
+      totalUnmatched += Math.max(0, fixList.length - matched);
+      const snapAfterSport = await prisma.oddsSnapshot.count();
+      const sportSnaps = Math.max(0, snapAfterSport - snapBeforeSport);
+      totalSnaps += sportSnaps;
+      results.push({
+        sportKey,
+        eventsFetched: events.length,
+        fixturesTargeted: fixList.length,
+        fixturesMatched: matched,
+        fixturesUnmatched: Math.max(0, fixList.length - matched),
+        unmatchedFixtures: unmatchedFixtures.slice(0, 10),
+        snapshotsUpserted: sportSnaps,
+      });
+    }
+
+    await prisma.oddsCaptureRun.update({
+      where: { id: run.id },
+      data: {
+        status: "completed",
+        sportResultsJson: JSON.stringify(results),
+        eventsFetched: totalEventsFetched,
+        fixturesTargeted: totalFixturesTargeted,
+        fixturesMatched: totalMatched,
+        fixturesUnmatched: totalUnmatched,
+        snapshotsUpserted: totalSnaps,
+        observationsAdded: totalObservationsAdded,
+        completedAt: new Date(),
+      },
+    });
+
+    await prisma.dataRefreshLog.create({
+      data: {
+        source: "odds-api",
+        status: "success",
+        count: totalSnaps,
+        message: JSON.stringify(results),
+      },
+    });
+
+    return results;
+  } catch (error) {
+    await prisma.oddsCaptureRun.update({
+      where: { id: run.id },
+      data: {
+        status: "failed",
+        errorMessage: error instanceof Error ? error.message : String(error),
+        completedAt: new Date(),
+      },
+    });
+    throw error;
   }
-
-  await prisma.dataRefreshLog.create({
-    data: {
-      source: "odds-api",
-      status: "success",
-      count: totalSnaps,
-      message: JSON.stringify(results),
-    },
-  });
-
-  return results;
 }
+
+export { teamsMatchOddsEvent } from "./team-normalize";

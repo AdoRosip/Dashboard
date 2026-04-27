@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
+import { MVP_SUPPORTED_COMPETITION_CODES } from "@/lib/mvp/config";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const league = searchParams.get("league");
+  const scope = searchParams.get("scope") ?? "mvp";
   const days = parseInt(searchParams.get("days") ?? "3", 10);
 
   const now = new Date();
@@ -16,6 +18,8 @@ export async function GET(request: Request) {
 
   if (league) {
     where.competitionId = league;
+  } else if (scope !== "all") {
+    where.competitionId = { in: [...MVP_SUPPORTED_COMPETITION_CODES] };
   }
 
   const fixtures = await prisma.fixture.findMany({

@@ -1,7 +1,37 @@
 export { removeMargin } from "./margin";
-export { checkValue, type ValueCheckInput, type ValuePickDraft } from "./value";
+export {
+  checkValue,
+  evaluateValue,
+  DEFAULT_VALUE_POLICY,
+  VALUE_REJECTION_REASON_LABELS,
+  type ValueCheckInput,
+  type ValueCheckResult,
+  type ValuePickDraft,
+  type ValuePolicy,
+  type ValueRejectionReason,
+} from "./value";
 export { refreshOddsForUpcomingFixtures, teamsMatchOddsEvent } from "./fetch";
+export {
+  runOddsCaptureCycle,
+  type OddsCaptureCycleOptions,
+  type OddsCaptureCycleResult,
+} from "./capture-cycle";
+export { backfillOddsObservationHistoryFromSnapshots } from "./history";
 export { recomputeValuePicksForUpcoming } from "./value-picks-service";
+export {
+  buildValueMarketCandidates,
+  SUPPORTED_VALUE_MARKETS,
+  type SupportedValueMarket,
+  type ValueMarketCandidate,
+} from "./value-candidates";
+export { getUpcomingValueDiagnostics, type UpcomingValueDiagnostics } from "./value-diagnostics";
+export { buildValueBacktestReport, type ValueBacktestReport } from "./backtest";
+export { getCandidateHistory } from "./candidate-history";
+export {
+  backfillBetDecisionsFromValuePicks,
+  createBetDecisionFromAcceptedCandidate,
+  getBetDecisionHistory,
+} from "./bet-decisions";
 export {
   canonicalProfitLossUnits,
   canonicalStakeUnits,

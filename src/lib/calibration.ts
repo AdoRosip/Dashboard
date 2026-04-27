@@ -1,7 +1,11 @@
 import { prisma } from "./db";
-import { CURRENT_SEASON } from "./constants";
 import { MODEL_VERSION } from "./prediction/engine";
 import { isHeadlineCalibrationMarket } from "./calibration/metrics";
+
+/** Bucket key for calibration rows; uses kickoff calendar year (fixture has no season column). */
+export function calibrationSeasonKeyFromFixture(utcDate: Date): string {
+  return String(utcDate.getUTCFullYear());
+}
 
 const BUCKETS = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
@@ -15,49 +19,77 @@ function bucketFor(p: number): { low: number; high: number; mid: number } {
   return { low: 0.9, high: 1.0, mid: 0.95 };
 }
 
-async function upsertCalibrationBucket(params: {
-  market: string;
-  league: string;
-  season: string;
-  prob: number;
-  hit: boolean;
-}): Promise<void> {
-  const { low, high, mid } = bucketFor(params.prob);
-  const existing = await prisma.calibrationBucket.findFirst({
-    where: {
-      market: params.market,
-      league: params.league,
-      season: params.season,
-      probBucketLow: low,
-      probBucketHigh: high,
+async function rebuildCalibrationBuckets(): Promise<void> {
+  const audits = await prisma.predictionAudit.findMany({
+    select: {
+      fixtureId: true,
+      market: true,
+      predictedProb: true,
+      actualOutcome: true,
     },
   });
-  const hits = params.hit ? 1 : 0;
-  if (existing) {
-    const tp = existing.totalPredictions + 1;
-    const ah = existing.actualHits + hits;
-    await prisma.calibrationBucket.update({
-      where: { id: existing.id },
-      data: {
-        totalPredictions: tp,
-        actualHits: ah,
-        actualRate: ah / tp,
-        calibrationError: Math.abs(mid - ah / tp),
-      },
+
+  await prisma.calibrationBucket.deleteMany();
+  if (audits.length === 0) return;
+
+  const fixtureIds = Array.from(new Set(audits.map((a) => a.fixtureId)));
+  const fixtures = await prisma.fixture.findMany({
+    where: { id: { in: fixtureIds } },
+    select: { id: true, competitionId: true, utcDate: true },
+  });
+  const fixtureMap = new Map(fixtures.map((f) => [f.id, f]));
+
+  const buckets = new Map<string, {
+    market: string;
+    league: string;
+    season: string;
+    probBucketLow: number;
+    probBucketHigh: number;
+    probBucketMid: number;
+    totalPredictions: number;
+    actualHits: number;
+  }>();
+
+  for (const audit of audits) {
+    const fixture = fixtureMap.get(audit.fixtureId);
+    if (!fixture) continue;
+
+    const { low, high, mid } = bucketFor(audit.predictedProb);
+    const season = calibrationSeasonKeyFromFixture(fixture.utcDate);
+    const key = [
+      audit.market,
+      fixture.competitionId,
+      season,
+      low.toFixed(1),
+      high.toFixed(1),
+    ].join("|");
+
+    const existing = buckets.get(key);
+    if (existing) {
+      existing.totalPredictions += 1;
+      existing.actualHits += audit.actualOutcome ? 1 : 0;
+      continue;
+    }
+
+    buckets.set(key, {
+      market: audit.market,
+      league: fixture.competitionId,
+      season,
+      probBucketLow: low,
+      probBucketHigh: high,
+      probBucketMid: mid,
+      totalPredictions: 1,
+      actualHits: audit.actualOutcome ? 1 : 0,
     });
-  } else {
+  }
+
+  for (const bucket of buckets.values()) {
+    const actualRate = bucket.actualHits / bucket.totalPredictions;
     await prisma.calibrationBucket.create({
       data: {
-        market: params.market,
-        league: params.league,
-        season: params.season,
-        probBucketLow: low,
-        probBucketHigh: high,
-        probBucketMid: mid,
-        totalPredictions: 1,
-        actualHits: hits,
-        actualRate: hits,
-        calibrationError: Math.abs(mid - hits),
+        ...bucket,
+        actualRate,
+        calibrationError: Math.abs(bucket.probBucketMid - actualRate),
       },
     });
   }
@@ -89,8 +121,6 @@ export async function runCalibrationForFinishedFixtures(): Promise<void> {
         orderBy: { updatedAt: "desc" },
       }));
     if (!pred) continue;
-
-    const league = f.competitionId;
 
     const hs = f.scoreHomeFt ?? 0;
     const as = f.scoreAwayFt ?? 0;
@@ -158,32 +188,33 @@ export async function runCalibrationForFinishedFixtures(): Promise<void> {
     ];
 
     for (const row of markets) {
-      const dup = await prisma.predictionAudit.findFirst({
+      const existingAudit = await prisma.predictionAudit.findFirst({
         where: { fixtureId: f.id, market: row.m },
-      });
-      if (dup) continue;
-
-      await prisma.predictionAudit.create({
-        data: {
-          fixtureId: f.id,
-          market: row.m,
-          modelVersion: pred.modelVersion,
-          predictedProb: row.p,
-          actualOutcome: row.hit,
-          brierContribution: row.brier,
-          logLoss: row.logLoss,
-        },
+        select: { id: true },
       });
 
-      await upsertCalibrationBucket({
+      const payload = {
+        fixtureId: f.id,
         market: row.m,
-        league,
-        season: CURRENT_SEASON,
-        prob: row.p,
-        hit: row.hit,
-      });
+        modelVersion: pred.modelVersion,
+        predictedProb: row.p,
+        actualOutcome: row.hit,
+        brierContribution: row.brier,
+        logLoss: row.logLoss,
+      };
+
+      if (existingAudit) {
+        await prisma.predictionAudit.update({
+          where: { id: existingAudit.id },
+          data: payload,
+        });
+      } else {
+        await prisma.predictionAudit.create({ data: payload });
+      }
     }
   }
+
+  await rebuildCalibrationBuckets();
 }
 
 /** Mean Brier over headline markets only (1X2 binary outcomes + O/U + BTTS). */

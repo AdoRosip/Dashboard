@@ -47,6 +47,15 @@ function nextEuropeanMatchImportance(
   return "knockout_european";
 }
 
+function isKnockoutFixture(
+  competitionId: string,
+  matchday: number | null,
+): boolean {
+  if (!EURO.has(competitionId)) return false;
+  if (matchday == null) return true;
+  return matchday > 6;
+}
+
 export async function refreshV2ForUpcomingFixtures(aheadDays = 2) {
   const now = new Date();
   const end = new Date(now.getTime() + aheadDays * 24 * 60 * 60 * 1000);
@@ -63,7 +72,7 @@ export async function refreshV2ForUpcomingFixtures(aheadDays = 2) {
     await upsertTeamFixtureCongestion(fx.homeTeamId, fx.id, fx.utcDate);
     await upsertTeamFixtureCongestion(fx.awayTeamId, fx.id, fx.utcDate);
 
-    const isKnockout = false;
+    const isKnockout = isKnockoutFixture(fx.competitionId, fx.matchday);
     const homeStatsComp = fx.homeTeam.competitionId ?? fx.competitionId;
     const awayStatsComp = fx.awayTeam.competitionId ?? fx.competitionId;
     await upsertMatchImportanceRow(
